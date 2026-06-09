@@ -84,7 +84,13 @@ DEFAULT_OBSTACLE_SPECS = [
 
 def _replan(env_map, agents, reward_ratio, obs_discount_factor=1.0,
             sample_recursion=0, sample_num_obstacle=0, sample_obstacle_hop=0):
-    """Run the greedy assignment and write a fresh shortest path onto each agent."""
+    """Run the greedy assignment and send each agent down its reward-maximizing path.
+
+    sequential_greedy_assignment scores each (agent, target) pair over a set of
+    sampled candidate paths and returns the highest-reward one. We follow that
+    path directly — it is generally NOT the shortest path for a reward-driven
+    policy, so recomputing a shortest path here would discard the planning.
+    """
     for agent in agents:
         agent.planned_path = []
     assignment = sequential_greedy_assignment(
@@ -94,13 +100,8 @@ def _replan(env_map, agents, reward_ratio, obs_discount_factor=1.0,
         sample_obstacle_hop=sample_obstacle_hop,
         verbose=True,
     )
-    for i, target in assignment.items():
-        try:
-            agents[i].planned_path = nx.shortest_path(
-                env_map, agents[i].position, target, weight="distance"
-            )
-        except (nx.NetworkXNoPath, nx.NodeNotFound):
-            agents[i].planned_path = []
+    for i, (target, path) in assignment.items():
+        agents[i].planned_path = list(path) if path else []
 
 
 def _path_blocked_by(path, blocked_pairs):

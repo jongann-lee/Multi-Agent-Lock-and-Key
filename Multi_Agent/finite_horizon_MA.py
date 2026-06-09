@@ -77,8 +77,10 @@ def finite_horizon_assignment(env_map: nx.Graph, agents, reward_ratio: float,
             to fall back to pure shortest-path scoring.
 
     Returns:
-        dict mapping agent index (in the input list) to target node.
-        Empty if there are no targets.
+        dict mapping agent index (in the input list) to (target_node, path),
+        where `path` is the reward-maximizing path that produced the pair's
+        score. The caller should send the agent down this path rather than
+        recomputing a shortest path. Empty if there are no targets.
     """
     targets = [
         n for n, d in env_map.nodes(data=True) if d.get("type") == "target_unreached"
@@ -89,18 +91,23 @@ def finite_horizon_assignment(env_map: nx.Graph, agents, reward_ratio: float,
     n_agents = len(agents)
     n_targets = len(targets)
     reward = np.full((n_agents, n_targets), UNREACHABLE_REWARD, dtype=float)
+    paths: dict = {}
 
     for i, agent in enumerate(agents):
         for j, target in enumerate(targets):
-            r, _path = _score_pair(
+            r, path = _score_pair(
                 env_map, agent, target, reward_ratio, discount_factor,
                 sample_recursion, sample_num_obstacle, sample_obstacle_hop,
             )
             if r > -np.inf:
                 reward[i, j] = r
+                paths[(i, j)] = path
 
     row_ind, col_ind = linear_sum_assignment(reward, maximize=True)
-    return {int(r): targets[c] for r, c in zip(row_ind, col_ind)}
+    return {
+        int(r): (targets[c], paths.get((int(r), int(c))))
+        for r, c in zip(row_ind, col_ind)
+    }
 
 
 def _score_pair(state, agent, target, reward_ratio, discount_factor,
@@ -173,7 +180,11 @@ def sequential_greedy_assignment(env_map: nx.Graph, agents, reward_ratio: float,
         discount_factor: per-step geometric discount on the visibility reward.
         verbose: if True, print per-round reward matrix and the selected pair.
 
-    Returns the same {agent_idx: target_node} format as finite_horizon_assignment.
+    Returns {agent_idx: (target_node, path)}, where `path` is the
+    reward-maximizing path that produced the agent's score. The caller should
+    send the agent down this path rather than recomputing a shortest path,
+    since for a reward-driven policy the best path is generally not the
+    shortest one. Same tuple format as finite_horizon_assignment.
     """
     targets = [
         n for n, d in env_map.nodes(data=True) if d.get("type") == "target_unreached"
@@ -239,7 +250,7 @@ def sequential_greedy_assignment(env_map: nx.Graph, agents, reward_ratio: float,
             break
 
         ai, target = best_pair
-        assignment[ai] = target
+        assignment[ai] = (target, best_path)
         remaining_agents.remove(ai)
         remaining_targets.remove(target)
 
