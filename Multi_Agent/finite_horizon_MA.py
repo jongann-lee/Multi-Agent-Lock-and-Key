@@ -100,14 +100,17 @@ def finite_horizon_assignment(env_map: nx.Graph, agents, edge_reward_ratio: floa
         agents: list of Agent objects.
         edge_reward_ratio: lambda weighting edge-visibility reward against distance cost.
         discount_factor: per-step geometric discount on the visibility reward.
+        target_reward_ratio: flat bonus per newly-observed target (lock revealed).
         sample_recursion, sample_num_obstacle, sample_obstacle_hop: parameters
             controlling how many diverse candidate paths to generate per pair
             via stochastic_accumulated_blockage_path. Set sample_recursion=0
             to fall back to pure shortest-path scoring.
 
     Returns:
-        dict mapping agent index (in the input list) to target node.
-        Empty if there are no targets.
+        dict mapping agent index (in the input list) to (target_node, path),
+        where `path` is the reward-maximizing path that produced the pair's
+        score. The caller should send the agent down this path rather than
+        recomputing a shortest path. Empty if there are no targets.
     """
     targets = [
         n for n, d in env_map.nodes(data=True) if d.get("type") == "target_unreached"
@@ -118,19 +121,24 @@ def finite_horizon_assignment(env_map: nx.Graph, agents, edge_reward_ratio: floa
     n_agents = len(agents)
     n_targets = len(targets)
     reward = np.full((n_agents, n_targets), UNREACHABLE_REWARD, dtype=float)
+    paths: dict = {}
 
     for i, agent in enumerate(agents):
         for j, target in enumerate(targets):
-            r, _path = _score_pair(
+            r, path = _score_pair(
                 env_map, agent, target, edge_reward_ratio, discount_factor,
                 sample_recursion, sample_num_obstacle, sample_obstacle_hop,
                 target_reward_ratio=target_reward_ratio,
             )
             if r > -np.inf:
                 reward[i, j] = r
+                paths[(i, j)] = path
 
     row_ind, col_ind = linear_sum_assignment(reward, maximize=True)
-    return {int(r): targets[c] for r, c in zip(row_ind, col_ind)}
+    return {
+        int(r): (targets[c], paths.get((int(r), int(c))))
+        for r, c in zip(row_ind, col_ind)
+    }
 
 
 def _score_pair(state, agent, target, edge_reward_ratio, discount_factor,
@@ -221,9 +229,13 @@ def sequential_greedy_assignment(env_map: nx.Graph, agents, edge_reward_ratio: f
         agents: list of Agent objects.
         edge_reward_ratio: lambda weighting edge-visibility reward against distance cost.
         discount_factor: per-step geometric discount on the visibility reward.
+        target_reward_ratio: flat bonus per newly-observed target (lock revealed).
         verbose: if True, print per-round reward matrix and the selected pair.
 
-    Returns the same {agent_idx: target_node} format as finite_horizon_assignment.
+    Returns {agent_idx: (target_node, path)}, where `path` is the
+    reward-maximizing path that produced the agent's score. The caller should
+    send the agent down this path rather than recomputing a shortest path, since
+    for reward-driven policies the best path is generally not the shortest one.
     """
     targets = [
         n for n, d in env_map.nodes(data=True) if d.get("type") == "target_unreached"
@@ -290,7 +302,7 @@ def sequential_greedy_assignment(env_map: nx.Graph, agents, edge_reward_ratio: f
             break
 
         ai, target = best_pair
-        assignment[ai] = target
+        assignment[ai] = (target, best_path)
         remaining_agents.remove(ai)
         remaining_targets.remove(target)
 
@@ -298,8 +310,8 @@ def sequential_greedy_assignment(env_map: nx.Graph, agents, edge_reward_ratio: f
             print(f"  >> Selected: Agent {ai} ({color_of(ai)}) -> "
                   f"Target {target_id[target]} @ {target} (reward = {best_reward:.4f})")
 
-        # Commit: replay the chosen path on the shared state so the edges and
-        # targets it observes propagate to remaining candidates.
+        # Commit: replay the chosen path on the shared state so the edges it
+        # observes (and targets it reveals) propagate to remaining candidates.
         calculate_path_reward(best_path, state, edge_reward_ratio, discount_factor,
                               target_reward_ratio=target_reward_ratio)
 
@@ -337,9 +349,14 @@ def replan(env_map: nx.Graph, agents, edge_reward_ratio: float,
     """Policy entry point used by the simulation driver.
 
     Clears every agent's planned_path, runs sequential_greedy_assignment
-    (the submodular-aware policy this module exists to implement), and
-    writes a fresh weighted shortest path from each assigned agent's
-    position to its target.
+    (the submodular-aware policy this module exists to implement), and sends
+    each agent down its reward-maximizing path.
+
+    sequential_greedy_assignment scores each (agent, target) pair over a set
+    of sampled candidate paths and returns the highest-reward one. We follow
+    that path directly — it is generally NOT the shortest path for a
+    reward-driven policy, so recomputing a shortest path here would discard
+    the planning.
     """
     for agent in agents:
         agent.planned_path = []
@@ -353,10 +370,5 @@ def replan(env_map: nx.Graph, agents, edge_reward_ratio: float,
         verbose=verbose,
     )
 
-    for i, target in assignment.items():
-        try:
-            agents[i].planned_path = nx.shortest_path(
-                env_map, agents[i].position, target, weight="distance"
-            )
-        except (nx.NetworkXNoPath, nx.NodeNotFound):
-            agents[i].planned_path = []
+    for i, (target, path) in assignment.items():
+        agents[i].planned_path = list(path) if path else []
