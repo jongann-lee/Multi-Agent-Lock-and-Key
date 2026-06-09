@@ -8,6 +8,7 @@ Mirrors the rendering rules used in Real_Life_Maps/visualization.ipynb:
   dotted line = planned path
 """
 import os
+import sys
 import subprocess
 from pathlib import Path
 
@@ -16,6 +17,13 @@ import matplotlib.colors as mcolors
 import matplotlib.patches as patches
 import matplotlib.collections as mc
 import networkx as nx
+
+# Pulled in just for the lock-rendering sentinel check.
+_THIS_DIR = os.path.dirname(os.path.abspath(__file__))
+_PROJECT_ROOT = os.path.abspath(os.path.join(_THIS_DIR, ".."))
+if _PROJECT_ROOT not in sys.path:
+    sys.path.insert(0, _PROJECT_ROOT)
+from Multi_Agent.finite_horizon_MA import UNKNOWN_LOCK
 
 
 DEFAULT_AGENT_COLORS = ["blue", "red", "green"]
@@ -115,14 +123,45 @@ def render_simulation_frame(env_map, blocked_env_graph, agents, turn_idx, output
         ax.scatter([p[0] for p in reached_pts], [p[1] for p in reached_pts],
                    marker='x', s=200, color='grey', linewidths=3, zorder=10)
 
+    # Lock-ID labels above each target. Source of truth is blocked_env_graph
+    # (the planner's env_map keeps UNKNOWN_LOCK until observed; here we want
+    # the actual lock for the human watching the video).
+    for node, data in env_map.nodes(data=True):
+        if data.get("type") not in ("target_unreached", "target_reached"):
+            continue
+        true_lock = blocked_env_graph.nodes[node].get("lock")
+        if true_lock is None or true_lock == UNKNOWN_LOCK:
+            continue
+        x, y = pos[node]
+        ax.text(x, y + cell_h * 0.5, str(true_lock),
+                fontsize=6, ha='center', va='bottom', zorder=12,
+                clip_on=False,
+                bbox=dict(facecolor='white', alpha=0.85, edgecolor='black',
+                          linewidth=0.3, pad=0.5))
+
     for i, agent in enumerate(agents):
         color = _agent_color(i, agent_colors)
         x, y = pos[agent.position]
         ax.scatter([x], [y], marker='o', s=130, facecolor=color, edgecolor='black',
                    linewidths=1.2, zorder=11)
+        # Key-list label below the agent dot. Empty key set renders as "-".
+        # Bbox border picks up the agent's color so it's easy to associate
+        # the labels with their owners when agents are clustered.
+        key_str = ",".join(str(k) for k in agent.possessed_keys) if agent.possessed_keys else "-"
+        ax.text(x, y - cell_h * 0.5, key_str,
+                fontsize=6, ha='center', va='top', zorder=12,
+                clip_on=False,
+                bbox=dict(facecolor='white', alpha=0.85, edgecolor=color,
+                          linewidth=0.6, pad=0.5))
 
+    # Reserve a full cell of padding above and below the grid so the lock /
+    # key labels (drawn half a cell outside the marker) always sit *inside*
+    # the axes box. Without this, labels at boundary cells overflow the axes,
+    # `bbox_inches='tight'` in savefig expands the saved image to include
+    # them, and the figure dimensions jitter frame-to-frame as agents move
+    # between boundary and interior cells.
     ax.set_xlim(xs[0] - cell_w / 2, xs[-1] + cell_w / 2)
-    ax.set_ylim(ys[0] - cell_h / 2, ys[-1] + cell_h / 2)
+    ax.set_ylim(ys[0] - cell_h * 1.5, ys[-1] + cell_h * 1.5)
     ax.set_aspect('equal')
     ax.axis('off')
     plt.title(title if title is not None else f"Turn {turn_idx}")
@@ -184,10 +223,17 @@ def make_mp4_from_frames(frames_dir, output_mp4, fps=4):
         return None
     pattern = str(Path(frames_dir) / "frame_%04d.png")
     Path(output_mp4).parent.mkdir(parents=True, exist_ok=True)
+    # libx264 with yuv420p needs both dimensions even (chroma subsampling).
+    # Whether matplotlib's `bbox_inches='tight'` happens to land on even
+    # pixel widths depends on grid size + label layout — coincidental at
+    # best, broken (e.g. 939x990) at worst. Round each dimension up to the
+    # nearest even number, padding with white if needed, so the encoder is
+    # always happy regardless of source PNG dimensions.
     cmd = [
         "ffmpeg", "-y",
         "-framerate", str(fps),
         "-i", pattern,
+        "-vf", "pad=ceil(iw/2)*2:ceil(ih/2)*2:color=white",
         "-c:v", "libx264",
         "-pix_fmt", "yuv420p",
         str(output_mp4),

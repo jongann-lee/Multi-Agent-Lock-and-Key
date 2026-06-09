@@ -19,6 +19,7 @@ import csv
 import pickle
 import argparse
 import subprocess
+import random
 
 import numpy as np
 import networkx as nx
@@ -29,11 +30,36 @@ if project_root not in sys.path:
 
 from Real_Life_Maps.real_map_generation import RealTerrainGrid
 from Graph_Generation.target_graph import create_fully_connected_target_graph
-from Multi_Agent.finite_horizon_MA import Agent, sequential_greedy_assignment
+from Multi_Agent.finite_horizon_MA import Agent, UNKNOWN_LOCK
 from Multi_Agent.simulation_utils import (
     render_simulation_frame, clear_frame_dir, make_mp4_from_frames,
     render_replan_debug_frame, clear_debug_dir,
 )
+
+
+# ---------------------------------------------------------------------------
+# Policy dispatch — each entry is a module that exposes a uniform
+# `replan(env_map, agents, ...)` entry point. Keys are assigned by the
+# environment (agent i -> key i), not the policy. Add new policies by adding
+# the module name to POLICIES.
+# ---------------------------------------------------------------------------
+
+POLICIES = ("finite_horizon_MA", "baseline1_shortest_path")
+
+
+def _load_policy(name):
+    """Resolve a `--policy NAME` string to the actual module.
+
+    Kept as an explicit allowlist (rather than `importlib` on arbitrary
+    strings) so typos surface as a clean error and the valid set shows up in
+    --help and in the error message.
+    """
+    import importlib
+    if name not in POLICIES:
+        raise ValueError(
+            f"unknown policy {name!r}; expected one of {POLICIES}"
+        )
+    return importlib.import_module(f"Multi_Agent.{name}")
 
 
 # ---------------------------------------------------------------------------
@@ -82,27 +108,6 @@ DEFAULT_OBSTACLE_SPECS = [
 # 4. Multi-agent simulation
 # ---------------------------------------------------------------------------
 
-def _replan(env_map, agents, reward_ratio, obs_discount_factor=1.0,
-            sample_recursion=0, sample_num_obstacle=0, sample_obstacle_hop=0):
-    """Run the greedy assignment and write a fresh shortest path onto each agent."""
-    for agent in agents:
-        agent.planned_path = []
-    assignment = sequential_greedy_assignment(
-        env_map, agents, reward_ratio, obs_discount_factor,
-        sample_recursion=sample_recursion,
-        sample_num_obstacle=sample_num_obstacle,
-        sample_obstacle_hop=sample_obstacle_hop,
-        verbose=True,
-    )
-    for i, target in assignment.items():
-        try:
-            agents[i].planned_path = nx.shortest_path(
-                env_map, agents[i].position, target, weight="distance"
-            )
-        except (nx.NetworkXNoPath, nx.NodeNotFound):
-            agents[i].planned_path = []
-
-
 def _path_blocked_by(path, blocked_pairs):
     """True if any consecutive pair in `path` is in `blocked_pairs`."""
     for k in range(len(path) - 1):
@@ -112,9 +117,11 @@ def _path_blocked_by(path, blocked_pairs):
 
 
 def run_multi_agent_simulation(env_graph, blocked_env_graph, source, num_agents,
-                               reward_ratio, obs_discount_factor=1.0,
+                               edge_reward_ratio, obs_discount_factor=1.0,
                                sample_recursion=0, sample_num_obstacle=0,
-                               sample_obstacle_hop=0,
+                               sample_obstacle_hop=0, target_reward_ratio=0.0,
+                               agent_keys=None,
+                               policy="finite_horizon_MA",
                                max_turns=2000, render_dir=None, debug_dir=None):
     """
     Args:
@@ -122,7 +129,12 @@ def run_multi_agent_simulation(env_graph, blocked_env_graph, source, num_agents,
         blocked_env_graph: ground-truth graph with ovals applied.
         source: starting node for all agents.
         num_agents: number of agents.
-        reward_ratio: lambda for path reward.
+        edge_reward_ratio: lambda weighting edge-visibility reward vs distance.
+        agent_keys: optional list of length `num_agents`, where each element is
+            an iterable of lock IDs that agent carries. If None, falls back to
+            the fixed-key rule "agent i carries key i".
+        policy: either a name from POLICIES or a policy module already imported
+            by the caller. Exposes `replan(env_map, agents, ...)`.
         max_turns: hard cap to avoid infinite loops on unsolvable realizations.
         render_dir: if set, write one PNG per turn to this directory.
 
@@ -130,8 +142,20 @@ def run_multi_agent_simulation(env_graph, blocked_env_graph, source, num_agents,
         dict with per-agent costs, trajectories, turn count, and whether all
         targets were reached.
     """
+    if isinstance(policy, str):
+        policy = _load_policy(policy)
     env_map = env_graph.copy()
-    agents = [Agent(source) for _ in range(num_agents)]
+
+    if agent_keys is None:
+        # Fixed-key formulation: agent i carries key i. Keys come from the
+        # environment, not the policy.
+        agent_keys = [[i] for i in range(num_agents)]
+    elif len(agent_keys) != num_agents:
+        raise ValueError(
+            f"agent_keys has length {len(agent_keys)} but num_agents={num_agents}"
+        )
+
+    agents = [Agent(source, possessed_keys=agent_keys[i]) for i in range(num_agents)]
     replan_times: list[float] = []
     replan_count = 0
 
@@ -149,13 +173,24 @@ def run_multi_agent_simulation(env_graph, blocked_env_graph, source, num_agents,
                                   replan_count, turn_idx, path)
 
     t0 = time.perf_counter()
-    _replan(env_map, agents, reward_ratio, obs_discount_factor,
-            sample_recursion, sample_num_obstacle, sample_obstacle_hop)
+    policy.replan(env_map, agents, edge_reward_ratio, obs_discount_factor,
+                  sample_recursion, sample_num_obstacle, sample_obstacle_hop,
+                  target_reward_ratio=target_reward_ratio, verbose=True)
     replan_times.append(time.perf_counter() - t0)
     _maybe_debug_replan(0)
     replan_count += 1
 
     _maybe_render(0)
+
+    # Carried across loop iterations: True when the most recent move phase
+    # drained some agent's planned_path from length >= 2 to < 2 (i.e. the
+    # agent actually walked to the end of its plan rather than receiving an
+    # empty plan from a replan). Consumed as a one-shot replan trigger at
+    # the top of the next iteration. Required for baseline2_greedy_single_key
+    # so an agent arriving at source can replan and pick up a new key —
+    # otherwise no existing trigger (newly_blocked / newly_revealed_locks /
+    # target_reached) fires on reaching source, and the agent just sits.
+    plan_just_exhausted = False
 
     turn = 0
     while turn < max_turns:
@@ -183,8 +218,34 @@ def run_multi_agent_simulation(env_graph, blocked_env_graph, source, num_agents,
                         e for e in env_map.nodes[node]["visible_edges"] if e not in newly_blocked
                     ]
 
+        # --- 1b. Reveal target locks at observed nodes ---
+        # Each agent observes every node in its `visible_nodes` set (computed by
+        # RealTerrainGrid.compute_all_visibilities) plus its own cell. For any
+        # such node that is a target with `lock == UNKNOWN_LOCK` in the
+        # planner's view, copy the ground-truth lock from blocked_env_graph onto
+        # env_map. Track whether anything changed so we can trigger a replan —
+        # the previous assignment may have been computed under an optimistic
+        # "lock unknown -> feasible" assumption that just got falsified.
+        newly_revealed_locks = False
+        for agent in agents:
+            observed_nodes = set(
+                blocked_env_graph.nodes[agent.position].get("visible_nodes", [])
+            )
+            observed_nodes.add(agent.position)  # standing on a node observes it
+            for n in observed_nodes:
+                if env_map.nodes[n].get("lock", UNKNOWN_LOCK) != UNKNOWN_LOCK:
+                    continue  # already known
+                true_lock = blocked_env_graph.nodes[n].get("lock")
+                if true_lock is None or true_lock == UNKNOWN_LOCK:
+                    continue  # not a target / nothing to reveal
+                env_map.nodes[n]["lock"] = true_lock
+                newly_revealed_locks = True
+
         # --- 2. Replan triggers ---
-        replan_needed = False
+        replan_needed = plan_just_exhausted  # consume the carried one-shot
+        plan_just_exhausted = False
+        if newly_revealed_locks:
+            replan_needed = True
         if newly_blocked:
             blocked_pairs = set()
             for u, v in newly_blocked:
@@ -197,20 +258,40 @@ def run_multi_agent_simulation(env_graph, blocked_env_graph, source, num_agents,
 
         for agent in agents:
             if env_map.nodes[agent.position].get("type") == "target_unreached":
-                env_map.nodes[agent.position]["type"] = "target_reached"
-                replan_needed = True
+                lock = env_map.nodes[agent.position].get("lock")
+                # Targets without a lock are openable by anyone; otherwise the
+                # agent has to be carrying the matching key. An agent standing
+                # on a locked target it can't open is just sitting there — the
+                # target stays `target_unreached` until a key-bearing agent
+                # arrives.
+                if lock is None or agent.has_key(lock):
+                    env_map.nodes[agent.position]["type"] = "target_reached"
+                    replan_needed = True
 
         if replan_needed:
             t0 = time.perf_counter()
-            _replan(env_map, agents, reward_ratio, obs_discount_factor,
-            sample_recursion, sample_num_obstacle, sample_obstacle_hop)
+            policy.replan(env_map, agents, edge_reward_ratio, obs_discount_factor,
+                          sample_recursion, sample_num_obstacle, sample_obstacle_hop,
+                          target_reward_ratio=target_reward_ratio, verbose=True)
             replan_times.append(time.perf_counter() - t0)
             _maybe_debug_replan(turn)
             replan_count += 1
 
+        # If the replan-triggers block just flipped the last unreached target
+        # to target_reached, break out NOW — before the move phase. Otherwise
+        # baseline2 (which routes spent agents back to source) would tick one
+        # extra step of "walk home" for every just-unlocked agent in the
+        # final turn, an asymmetric penalty vs baseline1 / finite_horizon_MA
+        # whose agents simply stop at the final target. The terminal unlock
+        # itself still counts — it was paid for by the previous turn's move.
+        if not [n for n, d in env_map.nodes(data=True)
+                if d.get("type") == "target_unreached"]:
+            break
+
         # --- 3. Move each agent up to movement_modifier steps ---
         any_progress = False
         for agent in agents:
+            initial_plan_len = len(agent.planned_path)
             for _ in range(agent.movement_modifier):
                 if len(agent.planned_path) < 2:
                     break
@@ -220,6 +301,11 @@ def run_multi_agent_simulation(env_graph, blocked_env_graph, source, num_agents,
                 cost = blocked_env_graph.edges[agent.position, next_node]["distance"]
                 agent.move(agent.position, next_node, cost)
                 any_progress = True
+            # Distinguish "agent finished its planned path by walking" from
+            # "agent was assigned an empty plan by the most recent replan":
+            # only the former should trigger another replan next turn.
+            if initial_plan_len >= 2 and len(agent.planned_path) < 2:
+                plan_just_exhausted = True
 
         if not any_progress and not replan_needed:
             break
@@ -250,7 +336,7 @@ def run_real_map_multi_agent_benchmark(
     source=(0, 0),
     targets=((14, 54), (1, 29), (33, 17), (34, 35), (63,37), (37,5), (49,58)),
     num_agents=2,
-    reward_ratio=1.0,
+    edge_reward_ratio=1.0,
     obs_discount_factor=1.0,
     target_num_neighbors=4,
     target_recursion=2,
@@ -259,7 +345,10 @@ def run_real_map_multi_agent_benchmark(
     sample_recursion=4,
     sample_num_obstacle=3,
     sample_obstacle_hop=4,
+    target_reward_ratio=0.0,
     obstacle_specs=None,
+    agent_keys=None,
+    policy="finite_horizon_MA",
     output_csv="./my_policy_simulation/real_map_ma_results.csv",
     output_json="./my_policy_simulation/real_map_ma_summary.json",
     render=False,
@@ -279,7 +368,8 @@ def run_real_map_multi_agent_benchmark(
     print("=" * 50)
     print("HYPERPARAMETERS")
     print("=" * 50)
-    print(f"reward_ratio:          {reward_ratio}")
+    print(f"edge_reward_ratio:     {edge_reward_ratio}")
+    print(f"target_reward_ratio:   {target_reward_ratio}")
     print(f"obs_discount_factor:   {obs_discount_factor}")
     print(f"target_num_neighbors:  {target_num_neighbors}")
     print(f"target_recursion:      {target_recursion}")
@@ -288,7 +378,16 @@ def run_real_map_multi_agent_benchmark(
     print(f"sample_recursion:      {sample_recursion}")
     print(f"sample_num_obstacle:   {sample_num_obstacle}")
     print(f"sample_obstacle_hop:   {sample_obstacle_hop}")
+    print(f"policy:                {policy if isinstance(policy, str) else policy.__name__}")
     print("=" * 50)
+
+    # Resolve the policy *once* so every downstream call (default keys, inner
+    # runner, summary) sees the same module.
+    if isinstance(policy, str):
+        policy_name = policy
+        policy = _load_policy(policy)
+    else:
+        policy_name = policy.__name__.split(".")[-1]
 
     # --- Build clean graph ---
     print("Loading DEM and roads...")
@@ -346,6 +445,26 @@ def run_real_map_multi_agent_benchmark(
             print(f"Target {t} unreachable from source {source} after blocking. Aborting.")
             return
 
+    # --- Assign locks to targets ---
+    # Locks are drawn from the agent key set {0, ..., num_agents-1} (agent i
+    # holds key i). To keep the lock types evenly represented, we build a
+    # repeated permutation: cycle the keys 0,1,2,0,1,2,... out to num_targets
+    # entries, then shuffle. E.g. 3 agents, 7 targets -> [0,1,2,0,1,2,0]
+    # shuffled. This guarantees every lock is openable by some agent and that
+    # no lock type dominates the map.
+    #
+    # Locks are partially observable: blocked_env_graph (ground truth) carries
+    # the true lock IDs; env_graph (planner's initial view) gets UNKNOWN_LOCK
+    # for every target. The simulation reveals the true lock onto env_map
+    # whenever an agent observes the target node.
+    lock_ids = [i % num_agents for i in range(len(targets))]
+    random.shuffle(lock_ids)
+    target_locks = {t: lock_ids[i] for i, t in enumerate(targets)}
+    for t, lock_id in target_locks.items():
+        env_graph.nodes[t]["lock"] = UNKNOWN_LOCK
+        blocked_env_graph.nodes[t]["lock"] = lock_id
+    print(f"Target locks (ground truth): {target_locks}")
+
     # --- Run the single deterministic realization ---
     render_path = None
     if render:
@@ -359,14 +478,26 @@ def run_real_map_multi_agent_benchmark(
         clear_debug_dir(debug_path)
         print(f"Saving replan-debug frames to {debug_path}")
 
+    # Fixed-key formulation: agent i carries key i. Keys are an environment
+    # property, not a policy choice. Pass an explicit `agent_keys` to override.
+    if agent_keys is None:
+        effective_agent_keys = [[i] for i in range(num_agents)]
+        print(f"agent_keys (fixed: agent i -> key i): {effective_agent_keys}")
+    else:
+        effective_agent_keys = [list(k) for k in agent_keys]
+        print(f"agent_keys: {effective_agent_keys}")
+
     print(f"\nRunning {num_agents} agents")
     t0 = time.perf_counter()
     result = run_multi_agent_simulation(
-        env_graph, blocked_env_graph, source, num_agents, reward_ratio,
+        env_graph, blocked_env_graph, source, num_agents, edge_reward_ratio,
         obs_discount_factor=obs_discount_factor,
         sample_recursion=sample_recursion,
         sample_num_obstacle=sample_num_obstacle,
         sample_obstacle_hop=sample_obstacle_hop,
+        target_reward_ratio=target_reward_ratio,
+        agent_keys=effective_agent_keys,
+        policy=policy,
         render_dir=render_path,
         debug_dir=debug_path,
     )
@@ -409,10 +540,12 @@ def run_real_map_multi_agent_benchmark(
 
     summary = {
         "map": f"WV_DEM_{n_size}x{n_size}",
+        "policy": policy_name,
         "num_agents": num_agents,
         "num_targets": len(targets),
         "num_obstacles": len(obstacle_specs),
-        "reward_ratio": reward_ratio,
+        "edge_reward_ratio": edge_reward_ratio,
+        "target_reward_ratio": target_reward_ratio,
         "completed": result["completed"],
         "turns": result["turns"],
         "avg_cost_per_agent": float(avg_cost),
@@ -422,6 +555,8 @@ def run_real_map_multi_agent_benchmark(
         "num_replans": len(replan_times),
         "mean_replan_time": mean_replan_time,
         "replan_times": [float(t) for t in replan_times],
+        "target_locks": {str(t): lock for t, lock in target_locks.items()},
+        "agent_keys": [list(k) for k in effective_agent_keys],
     }
     with open(output_json_path, "w") as f:
         json.dump(summary, f, indent=2)
@@ -449,6 +584,9 @@ def main():
                         help="On every replan, save a separate frame overlaying all "
                              "(agent, target) shortest paths as dashed lines.")
     parser.add_argument("--debug-dir", type=str, default="./my_policy_simulation/replan_debug")
+    parser.add_argument("--policy", type=str, default="finite_horizon_MA", choices=POLICIES,
+                        help="Which planning policy to run. Default is the main "
+                             "(submodular-aware) policy in finite_horizon_MA.py.")
     args = parser.parse_args()
 
     here = os.path.dirname(os.path.abspath(__file__))
@@ -464,7 +602,8 @@ def main():
         sys.exit(1)
 
     # --- Algorithm hyperparameters (set here, not via CLI) ---
-    reward_ratio = 1.0
+    edge_reward_ratio = 1.0
+    target_reward_ratio = 0.0
     obs_discount_factor = 0.9
     target_num_neighbors = 3
     target_recursion = 2
@@ -473,13 +612,19 @@ def main():
     sample_recursion = 2
     sample_num_obstacle = 3
     sample_obstacle_hop = 4
+    
+
+    # Random seed for reproducibility.
+    random_seed = 42
+    random.seed(random_seed)
+    np.random.seed(random_seed)
 
     run_real_map_multi_agent_benchmark(
         dem_path=args.dem_path,
         road_pkl=args.road_pkl,
         n_size=args.grid_size,
         num_agents=args.num_agents,
-        reward_ratio=reward_ratio,
+        edge_reward_ratio=edge_reward_ratio,
         obs_discount_factor=obs_discount_factor,
         target_num_neighbors=target_num_neighbors,
         target_recursion=target_recursion,
@@ -488,6 +633,8 @@ def main():
         sample_recursion=sample_recursion,
         sample_num_obstacle=sample_num_obstacle,
         sample_obstacle_hop=sample_obstacle_hop,
+        target_reward_ratio=target_reward_ratio,
+        policy=args.policy,
         output_csv=args.output,
         output_json=args.output_summary,
         render=args.render,

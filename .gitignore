@@ -15,3 +15,5 @@ wheels/
 # Cache
 *.cache/
 
+# The simulation results
+Multi_Agent/my_policy_simulation/

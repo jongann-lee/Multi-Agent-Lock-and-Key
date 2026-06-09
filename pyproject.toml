@@ -1,0 +1,14 @@
+[project]
+name = "uncertain-edge-tsp"
+version = "0.1.0"
+description = "Add your description here"
+readme = "README.md"
+requires-python = ">=3.12"
+dependencies = [
+    "matplotlib>=3.10.6",
+    "networkx>=3.5",
+    "rasterio>=1.5.0",
+    "scipy>=1.16.2",
+    "tdqm>=0.0.1",
+    "osmnx>=2.0.0",
+]

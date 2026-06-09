@@ -11,41 +11,57 @@ import time
 import numpy as np
 import networkx as nx
 
-from Single_Agent.reward_functions import visibility_reward
+from Single_Agent.reward_functions import edge_visibility_reward, target_observation_reward, UNKNOWN_LOCK
 from Single_Agent.lin_kernighan_tsp import solve_tsp_lin_kernighan
 from Graph_Generation.target_graph import stochastic_accumulated_blockage_path, create_fully_connected_target_graph
 
-def calculate_path_reward(path, env_graph: nx.Graph, reward_ratio: float, discount_factor: float = 1.0) -> float:
+def calculate_path_reward(path, env_graph: nx.Graph, edge_reward_ratio: float, discount_factor: float = 1.0,
+                          target_reward_ratio: float = 0.0) -> float:
     """
     Calculates the total reward for a given path in the enviroment graph.
 
     The environment graph contains nodes with a 'visible_edges' attribute,
-    the edges have a 'distance', 'observed_edge', 'num_used' attribute. 
+    the edges have a 'distance', 'observed_edge', 'num_used' attribute.
 
     They are used to calculate reward function, which is defined in reward_functions.py
 
     Note that we do not calculate the visibility reward at the final node in the path for consistency.
 
+    Reward = edge_reward_ratio * (edge visibility) + target_reward_ratio *
+    (targets observed) - distance. The target term gives a flat
+    `target_reward_ratio` bonus for each previously-unobserved target whose
+    lock the path reveals (i.e. that falls in some path node's
+    `visible_nodes`). Leave target_reward_ratio at 0.0 to recover the original
+    edge-only behavior.
+
     Args:
         path (list): A list of nodes representing the path taken by the agent.
         env_graph (nx.Graph): The environment graph containing nodes and edges with attributes.
-        reward_ratio (float): A weighting factor to balance visibility reward and distance penalty.
+        edge_reward_ratio (float): Weight on the edge-visibility reward vs the distance penalty.
         discount_factor (float): A factor to discount future observaton rewards.
-    Returns: 
+        target_reward_ratio (float): Flat bonus per newly-observed target
+            (lock revealed). Weighted independently of the edge reward.
+    Returns:
         float: The total calculated reward for the given path.
     """
 
-    total_visibility_reward = 0.0
+    total_edge_visibility_reward = 0.0
+    total_target_reward = 0.0
     total_distance = 0.0
 
     for i in range(len(path) - 1):
 
         current_node = path[i]
         next_node = path[i+1]
-        
+
         # Calculate visibility reward at the current node
-        node_visibility_reward = visibility_reward(env_graph, current_node)
-        total_visibility_reward += node_visibility_reward * (discount_factor ** i)
+        node_visibility_reward = edge_visibility_reward(env_graph, current_node)
+        total_edge_visibility_reward += node_visibility_reward * (discount_factor ** i)
+
+        # Calculate target-observation reward at the current node (count of
+        # newly-observable unknown-lock targets in view)
+        node_target_reward = target_observation_reward(env_graph, current_node)
+        total_target_reward += node_target_reward * (discount_factor ** i)
 
         # Calculate the distance to the next node
         edge_distance = env_graph.edges[current_node, next_node]["distance"]
@@ -55,31 +71,46 @@ def calculate_path_reward(path, env_graph: nx.Graph, reward_ratio: float, discou
         if "visible_edges" in env_graph.nodes[current_node]:
             visible_edges = env_graph.nodes[current_node]["visible_edges"]
             visible_unexplored_edges = [edge for edge in visible_edges if env_graph.edges[edge]["observed_edge"] == False]
-            
+
             if len(visible_unexplored_edges) > 0:
                 for edge in visible_unexplored_edges:
                     env_graph.edges[edge]["observed_edge"] = True
 
+        # Mark targets observed after crediting them, so a target in view from
+        # multiple path nodes (or from a later agent's path in the submodular
+        # greedy) is only counted once.
+        if "visible_nodes" in env_graph.nodes[current_node]:
+            for vn in env_graph.nodes[current_node]["visible_nodes"]:
+                nd = env_graph.nodes[vn]
+                if ("lock" in nd
+                        and nd["lock"] == UNKNOWN_LOCK
+                        and not nd.get("observed_target", False)):
+                    nd["observed_target"] = True
+
         # Move to the next node in the path
         current_node = next_node
-    
+
     # Calculate the final reward
 
-    total_reward = reward_ratio * total_visibility_reward - total_distance
+    total_reward = (edge_reward_ratio * total_edge_visibility_reward
+                    + target_reward_ratio * total_target_reward
+                    - total_distance)
 
     return total_reward
     
         
 class RepeatedTopK:
-    def __init__(self, reward_ratio: float, env_graph: nx.Graph, 
+    def __init__(self, edge_reward_ratio: float, env_graph: nx.Graph,
                     sample_recursion: int, sample_num_obstacle: int, sample_obstacle_hop: int,
                     target_graph_num_neighbors: int = 4, target_graph_recursions: int = 2,
-                    target_graph_num_obstacles: int = 2, target_graph_obstacle_hop: int = 2, obs_discount_factor: float = 1.0):
+                    target_graph_num_obstacles: int = 2, target_graph_obstacle_hop: int = 2, obs_discount_factor: float = 1.0,
+                    target_reward_ratio: float = 0.0):
             """
             Initializes the RepeatedTopK method with the specified parameters.
 
             Args:
-                reward_ratio (float): A weighting factor to balance visibility reward and distance penalty.
+                edge_reward_ratio (float): Weight on the edge-visibility reward
+                    (vs the distance penalty) in calculate_path_reward.
                 env_graph (nx.Graph): The environment graph.
                 sample_recursion (int): Recursion depth for stochastic path sampling.
                 sample_num_obstacle (int): Number of obstacles per recursion level for sampling.
@@ -89,8 +120,12 @@ class RepeatedTopK:
                 target_graph_num_obstacles (int): Number of obstacles for target graph diverse paths.
                 target_graph_obstacle_hop (int): Hop radius for target graph diverse paths.
                 obs_discount_factor (float): Discount factor for visibility reward in path reward calculation.
+                target_reward_ratio (float): Flat bonus per newly-observed target
+                    (lock revealed), weighted independently of the edge reward.
+                    Defaults to 0.0 (edge-only reward, original behavior).
             """
-            self.reward_ratio = reward_ratio
+            self.edge_reward_ratio = edge_reward_ratio
+            self.target_reward_ratio = target_reward_ratio
             self.env_graph = env_graph
             self.target_graph = None  # Built dynamically in find_best_path
             self.obs_discount_factor = obs_discount_factor
@@ -138,7 +173,7 @@ class RepeatedTopK:
         # then use the negative reward as the initial weight (since TSP minimizes).
         for u, v in self.target_graph.edges():
             best_path = self.process_section(u, v)
-            best_reward = calculate_path_reward(best_path, self.env_graph.copy(), self.reward_ratio, self.obs_discount_factor)
+            best_reward = calculate_path_reward(best_path, self.env_graph.copy(), self.edge_reward_ratio, self.obs_discount_factor, target_reward_ratio=self.target_reward_ratio)
             self.target_graph.edges[u, v]['distance'] = -best_reward
             self.target_graph.edges[u, v]['best_path'] = best_path
 
@@ -311,7 +346,7 @@ class RepeatedTopK:
             
             # Calculate the reward for the base path
             # Note: Assuming calculate_path_reward is available in scope or imported
-            reward = calculate_path_reward(shortest_path, self.env_graph.copy(), self.reward_ratio, self.obs_discount_factor)
+            reward = calculate_path_reward(shortest_path, self.env_graph.copy(), self.edge_reward_ratio, self.obs_discount_factor, target_reward_ratio=self.target_reward_ratio)
             if reward > best_reward:
                 best_reward = reward
                 best_path = shortest_path
@@ -325,7 +360,7 @@ class RepeatedTopK:
             
             t_reward = time.perf_counter()
             for d_path in deviated_paths:
-                reward = calculate_path_reward(d_path, self.env_graph.copy(), self.reward_ratio, self.obs_discount_factor)
+                reward = calculate_path_reward(d_path, self.env_graph.copy(), self.edge_reward_ratio, self.obs_discount_factor, target_reward_ratio=self.target_reward_ratio)
                 if reward > best_reward:
                     best_reward = reward
                     best_path = d_path
@@ -348,7 +383,7 @@ class RepeatedTopK:
             # First calculate the reward of the shortest path
             try:
                 base_path = nx.shortest_path(self.env_graph, begin_node, end_node, "distance")
-                reward = calculate_path_reward(base_path, self.env_graph.copy(), self.reward_ratio, self.obs_discount_factor)
+                reward = calculate_path_reward(base_path, self.env_graph.copy(), self.edge_reward_ratio, self.obs_discount_factor, target_reward_ratio=self.target_reward_ratio)
                 if reward > best_reward:
                     best_reward = reward
                     best_path = base_path
@@ -358,7 +393,7 @@ class RepeatedTopK:
                     
 
                 for d_path in deviated_paths:
-                    reward = calculate_path_reward(d_path, self.env_graph.copy(), self.reward_ratio, self.obs_discount_factor)
+                    reward = calculate_path_reward(d_path, self.env_graph.copy(), self.edge_reward_ratio, self.obs_discount_factor, target_reward_ratio=self.target_reward_ratio)
                     if reward > best_reward:
                         best_reward = reward
                         best_path = d_path

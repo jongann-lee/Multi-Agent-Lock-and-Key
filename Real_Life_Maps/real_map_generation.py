@@ -100,14 +100,18 @@ class RealTerrainGrid:
 
     def compute_all_visibilities(self, max_radius=30, angular_res=180):
             """
-            Iterates through all nodes and calculates visibility using 
+            Iterates through all nodes and calculates visibility using
             the manifold radial sweep method.
             """
-            all_vis = {}
+            all_vis_nodes = {}
+            all_vis_edges = {}
             for node in self.G.nodes():
-                all_vis[node] = self._get_polytope_visibility(node, max_radius, angular_res)
-            
-            nx.set_node_attributes(self.G, all_vis, name="visible_edges")
+                vis_nodes, vis_edges = self._get_polytope_visibility(node, max_radius, angular_res)
+                all_vis_nodes[node] = vis_nodes
+                all_vis_edges[node] = vis_edges
+
+            nx.set_node_attributes(self.G, all_vis_nodes, name="visible_nodes")
+            nx.set_node_attributes(self.G, all_vis_edges, name="visible_edges")
 
     def _get_polytope_visibility(self, obs_node, max_radius, angular_res):
             r0, c0 = obs_node
@@ -175,8 +179,8 @@ class RealTerrainGrid:
                 for v in self.G.predecessors(u):
                     if v in visible_nodes_set:
                         vis_edges.append((v, u))
-            
-            return list(set(vis_edges))
+
+            return list(visible_nodes_set), list(set(vis_edges))
         
 
     def get_graph(self):
