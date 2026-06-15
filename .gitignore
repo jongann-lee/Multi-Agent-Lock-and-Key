@@ -17,3 +17,6 @@ wheels/
 
 # The simulation results
 Multi_Agent/my_policy_simulation/
+
+# Mac OS files
+*.DS_Store
