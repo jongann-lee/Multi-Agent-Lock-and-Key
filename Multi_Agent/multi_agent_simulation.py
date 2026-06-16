@@ -32,8 +32,9 @@ from Graph_Generation.target_graph import create_fully_connected_target_graph
 from Multi_Agent.finite_horizon_MA import Agent
 from Multi_Agent.simulation_utils import (
     Target, load_real_terrain, load_roads, _replan, _path_blocked_by,
-    _snapshot_base_type, _sync_targets_to_graph,
+    _snapshot_base_type, _sync_targets_to_graph, agent_visible_nodes,
 )
+from Multi_Agent.baseline1_naive_tracking import replan as baseline_replan
 from Multi_Agent.rendering_utils import (
     render_simulation_frame, clear_frame_dir, make_mp4_from_frames,
     render_replan_debug_frame, clear_debug_dir,
@@ -53,7 +54,7 @@ DEFAULT_OBSTACLE_SPECS = []
 
 # Default target coordinate pool. `num_targets` selects the first N of these;
 # extend this list to make more targets available.
-DEFAULT_TARGETS = [(14, 54), (1, 29), (33, 17), (34, 35), (63, 37), (37, 5), (49, 58)]
+DEFAULT_TARGETS = [(63,63), (14, 54), (1, 29), (33, 17), (34, 35), (63, 37), (37, 5), (49, 58)]
 
 
 
@@ -69,6 +70,7 @@ def run_multi_agent_simulation(env_graph, blocked_env_graph, source, num_agents,
                                target_num_neighbors=4, target_recursion=2,
                                target_num_obstacles=2, target_obstacle_hop=2,
                                target_lookahead=10,
+                               policy="greedy", visible_steps=3,
                                max_turns=2000, render_dir=None, debug_dir=None):
     """
     Args:
@@ -83,6 +85,12 @@ def run_multi_agent_simulation(env_graph, blocked_env_graph, source, num_agents,
             Target). The planner sees true positions: every target is stamped
             onto env_map each observation.
         target_lookahead: number of steps each target keeps planned ahead.
+        policy: "greedy" (reward-maximizing assignment, replans on capture /
+            newly-blocked edge) or "shortest" (baseline shortest-path tracker;
+            replans every turn since targets move — see baseline1_naive_tracking).
+        visible_steps: line-of-sight horizon for the engagement rule — how many
+            of a visible target's planned steps the planner may use, and how many
+            are previewed in renders.
         max_turns: hard cap to avoid infinite loops on unsolvable realizations.
         render_dir: if set, write one PNG per turn to this directory.
 
@@ -103,7 +111,7 @@ def run_multi_agent_simulation(env_graph, blocked_env_graph, source, num_agents,
             return
         path = os.path.join(render_dir, f"frame_{idx:04d}.png")
         render_simulation_frame(env_map, blocked_env_graph, agents, idx, path,
-                                targets=targets)
+                                targets=targets, target_preview_steps=visible_steps)
 
     def _maybe_debug_replan(turn_idx):
         if debug_dir is None:
@@ -112,17 +120,28 @@ def run_multi_agent_simulation(env_graph, blocked_env_graph, source, num_agents,
         render_replan_debug_frame(env_map, blocked_env_graph, agents,
                                   replan_count, turn_idx, path, targets=targets)
 
+    def _do_replan():
+        """Dispatch to the configured planner. Greedy uses reward-maximizing
+        diverse-path assignment on env_map; shortest uses the baseline tracker,
+        which needs the targets and the line-of-sight set."""
+        if policy == "shortest":
+            visible_nodes = agent_visible_nodes(blocked_env_graph, agents)
+            baseline_replan(env_map, agents, targets, visible_nodes,
+                            max_visible_steps=visible_steps, verbose=True)
+        else:
+            _replan(env_map, agents, reward_ratio, obs_discount_factor,
+                    sample_recursion, sample_num_obstacle, sample_obstacle_hop,
+                    source=source, target_num_neighbors=target_num_neighbors,
+                    target_recursion=target_recursion,
+                    target_num_obstacles=target_num_obstacles,
+                    target_obstacle_hop=target_obstacle_hop)
+
     # Stamp the initial target positions onto the planner map before the first
     # assignment, then plan and render the opening frame.
     _sync_targets_to_graph(env_map, targets, base_type)
 
     t0 = time.perf_counter()
-    _replan(env_map, agents, reward_ratio, obs_discount_factor,
-            sample_recursion, sample_num_obstacle, sample_obstacle_hop,
-            source=source, target_num_neighbors=target_num_neighbors,
-            target_recursion=target_recursion,
-            target_num_obstacles=target_num_obstacles,
-            target_obstacle_hop=target_obstacle_hop)
+    _do_replan()
     replan_times.append(time.perf_counter() - t0)
     _maybe_debug_replan(0)
     replan_count += 1
@@ -166,7 +185,10 @@ def run_multi_agent_simulation(env_graph, blocked_env_graph, source, num_agents,
         _sync_targets_to_graph(env_map, targets, base_type)
 
         # --- 3. Replan triggers ---
-        replan_needed = captured
+        # The shortest-path tracker re-evaluates every turn (targets move, so its
+        # goals go stale immediately). Greedy replans only on capture or when a
+        # planned edge is newly known to be blocked.
+        replan_needed = captured or policy == "shortest"
         if newly_blocked:
             blocked_pairs = set()
             for u, v in newly_blocked:
@@ -179,12 +201,7 @@ def run_multi_agent_simulation(env_graph, blocked_env_graph, source, num_agents,
 
         if replan_needed:
             t0 = time.perf_counter()
-            _replan(env_map, agents, reward_ratio, obs_discount_factor,
-                    sample_recursion, sample_num_obstacle, sample_obstacle_hop,
-                    source=source, target_num_neighbors=target_num_neighbors,
-                    target_recursion=target_recursion,
-                    target_num_obstacles=target_num_obstacles,
-                    target_obstacle_hop=target_obstacle_hop)
+            _do_replan()
             replan_times.append(time.perf_counter() - t0)
             _maybe_debug_replan(turn)
             replan_count += 1
@@ -243,6 +260,8 @@ def run_real_map_multi_agent_benchmark(
     target_num_obstacles=3,
     target_obstacle_hop=4,
     target_lookahead=10,
+    policy="greedy",
+    visible_steps=3,
     sample_recursion=4,
     sample_num_obstacle=3,
     sample_obstacle_hop=4,
@@ -280,6 +299,8 @@ def run_real_map_multi_agent_benchmark(
     print("=" * 50)
     print("HYPERPARAMETERS")
     print("=" * 50)
+    print(f"policy:                {policy}")
+    print(f"visible_steps:         {visible_steps}")
     print(f"reward_ratio:          {reward_ratio}")
     print(f"obs_discount_factor:   {obs_discount_factor}")
     print(f"target_num_neighbors:  {target_num_neighbors}")
@@ -376,6 +397,8 @@ def run_real_map_multi_agent_benchmark(
         target_num_obstacles=target_num_obstacles,
         target_obstacle_hop=target_obstacle_hop,
         target_lookahead=target_lookahead,
+        policy=policy,
+        visible_steps=visible_steps,
         render_dir=render_path,
         debug_dir=debug_path,
     )
@@ -450,6 +473,9 @@ def main():
                         help="Use the first N coordinates from the target pool. "
                              "Omit to use all of them.")
     parser.add_argument("--num-agents", type=int, default=2)
+    parser.add_argument("--policy", choices=["greedy", "shortest"], default="greedy",
+                        help="Planner: 'greedy' (reward-maximizing, default) or "
+                             "'shortest' (baseline shortest-path tracker).")
     parser.add_argument("--output", type=str, default="./my_policy_simulation/real_map_ma_results.csv")
     parser.add_argument("--output-summary", type=str, default="./my_policy_simulation/real_map_ma_summary.json")
     parser.add_argument("--render", action="store_true",
@@ -502,6 +528,7 @@ def main():
         n_size=args.grid_size,
         num_targets=args.num_targets,
         num_agents=args.num_agents,
+        policy=args.policy,
         reward_ratio=reward_ratio,
         obs_discount_factor=obs_discount_factor,
         target_num_neighbors=target_num_neighbors,

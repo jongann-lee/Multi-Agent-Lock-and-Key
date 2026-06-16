@@ -6,6 +6,8 @@ Mirrors the rendering rules used in Real_Life_Maps/visualization.ipynb:
 - source = green circle, target_unreached = red X, target_reached = grey X
 - each agent gets a single color; solid line = trajectory so far,
   dotted line = planned path
+- a target within an agent's line of sight also shows its next few planned
+  steps as a magenta dotted line
 """
 import os
 import subprocess
@@ -17,8 +19,14 @@ import matplotlib.patches as patches
 import matplotlib.collections as mc
 import networkx as nx
 
+from Multi_Agent.simulation_utils import agent_visible_nodes
+
 
 DEFAULT_AGENT_COLORS = ["blue", "red", "green"]
+
+# When a target is within an agent's line of sight, its next few planned steps
+# are previewed as a dotted line in this colour (distinct from the agent reds).
+TARGET_PREDICTION_COLOR = "magenta"
 
 
 def _agent_color(idx, agent_colors=None):
@@ -30,12 +38,19 @@ def _agent_color(idx, agent_colors=None):
 
 def render_simulation_frame(env_map, blocked_env_graph, agents, turn_idx, output_path,
                             agent_colors=None, title=None, extra_paths=None,
-                            targets=None):
+                            targets=None, target_preview_steps=3):
     """Render one frame of the multi-agent simulation to PNG.
+
+    Target rendering rules: a target is always drawn as an X marker — red while
+    unreached, grey once reached. In addition, if an unreached target is within
+    an agent's line of sight, its next `target_preview_steps` planned steps are
+    previewed as a dotted line (the engagement rule that lets the planner peek a
+    few steps ahead when it can see the target, shown here as a render-only cue).
 
     Args:
         env_map: planner's view of the graph (used for the source marker).
-        blocked_env_graph: ground-truth graph (used for terrain, obstacles, roads).
+        blocked_env_graph: ground-truth graph (used for terrain, obstacles,
+            roads, and the agents' line-of-sight `visible_edges`).
         agents: list of Agent instances (each with .position, .trajectory, .planned_path).
         turn_idx: integer turn number — used in title and filename ordering.
         output_path: absolute path to write the PNG.
@@ -47,6 +62,9 @@ def render_simulation_frame(env_map, blocked_env_graph, agents, turn_idx, output
         targets: optional list of Target objects. Target markers are drawn from
             each target's live .position/.reached. If omitted, falls back to
             scanning env_map node types (legacy static-target behaviour).
+        target_preview_steps: how many upcoming planned steps to preview for a
+            visible target (0 disables the preview). Only used when `targets` is
+            given.
     """
     pos = nx.get_node_attributes(blocked_env_graph, 'pos')
     all_heights = [d.get('height', 0) for _, d in blocked_env_graph.nodes(data=True)]
@@ -101,8 +119,22 @@ def render_simulation_frame(env_map, blocked_env_graph, agents, turn_idx, output
     src_pts = [pos[n] for n, d in env_map.nodes(data=True) if d.get("type") == "source"]
     unreached_pts, reached_pts = [], []
     if targets is not None:
+        # Preview the next few planned steps of any target currently in an
+        # agent's line of sight (drawn before the markers so the X sits on top).
+        visible_nodes = agent_visible_nodes(blocked_env_graph, agents)
         for tgt in targets:
-            (reached_pts if tgt.reached else unreached_pts).append(pos[tgt.position])
+            if tgt.reached:
+                reached_pts.append(pos[tgt.position])
+                continue
+            unreached_pts.append(pos[tgt.position])
+            if target_preview_steps > 0 and tgt.position in visible_nodes:
+                preview = [tgt.position] + list(tgt.planned[:target_preview_steps])
+                if len(preview) >= 2:
+                    segs = [[pos[preview[k]], pos[preview[k + 1]]]
+                            for k in range(len(preview) - 1)]
+                    ax.add_collection(mc.LineCollection(
+                        segs, colors=TARGET_PREDICTION_COLOR, linewidths=2.5,
+                        zorder=7, linestyles='dotted'))
     else:
         for node, data in env_map.nodes(data=True):
             t = data.get("type")

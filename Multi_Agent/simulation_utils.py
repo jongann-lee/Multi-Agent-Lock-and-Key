@@ -237,6 +237,22 @@ def _path_blocked_by(path, blocked_pairs):
 # Planner-map sync for moving targets
 # ---------------------------------------------------------------------------
 
+def agent_visible_nodes(graph, agents):
+    """Union of nodes within any agent's line of sight.
+
+    Visibility is stored per node as `visible_edges` on the ground-truth graph;
+    a node is visible from an agent if it is an endpoint of one of those edges.
+    This is the observation channel the engagement rule uses: a target on a
+    visible node has its next few planned steps revealed to the planner.
+    """
+    visible = set()
+    for agent in agents:
+        for u, v in graph.nodes[agent.position].get("visible_edges", []):
+            visible.add(u)
+            visible.add(v)
+    return visible
+
+
 def _snapshot_base_type(graph):
     """Record each node's non-target base type so target stamps can be undone.
 
