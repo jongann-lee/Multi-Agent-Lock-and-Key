@@ -201,7 +201,7 @@ def sequential_greedy_assignment(env_map: nx.Graph, agents, reward_ratio: float,
     agent_colors = None
     target_id = None
     if verbose:
-        from Multi_Agent.simulation_utils import DEFAULT_AGENT_COLORS
+        from Multi_Agent.rendering_utils import DEFAULT_AGENT_COLORS
         agent_colors = DEFAULT_AGENT_COLORS
         target_id = {t: j for j, t in enumerate(targets)}
 

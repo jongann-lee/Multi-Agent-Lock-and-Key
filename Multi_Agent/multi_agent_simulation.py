@@ -16,7 +16,7 @@ import time
 import copy
 import json
 import csv
-import pickle
+import random
 import argparse
 import subprocess
 
@@ -29,101 +29,60 @@ if project_root not in sys.path:
 
 from Real_Life_Maps.real_map_generation import RealTerrainGrid
 from Graph_Generation.target_graph import create_fully_connected_target_graph
-from Multi_Agent.finite_horizon_MA import Agent, sequential_greedy_assignment
+from Multi_Agent.finite_horizon_MA import Agent
 from Multi_Agent.simulation_utils import (
+    Target, load_real_terrain, load_roads, _replan, _path_blocked_by,
+    _snapshot_base_type, _sync_targets_to_graph,
+)
+from Multi_Agent.rendering_utils import (
     render_simulation_frame, clear_frame_dir, make_mp4_from_frames,
     render_replan_debug_frame, clear_debug_dir,
 )
 
 
-# ---------------------------------------------------------------------------
-# 1. DEM + road loading
-# ---------------------------------------------------------------------------
-
-def get_grid_from_local_dem(file_path, n_size):
-    import rasterio
-    from rasterio.enums import Resampling
-
-    with rasterio.open(file_path) as dataset:
-        data = dataset.read(
-            1, out_shape=(n_size, n_size), resampling=Resampling.bilinear
-        )
-        if dataset.nodata is not None:
-            data = np.where(data == dataset.nodata, np.nan, data)
-        return data
-
-
-def load_real_terrain(dem_path, n_size=64):
-    height_grid = get_grid_from_local_dem(dem_path, n_size)
-    return np.rot90(height_grid, k=-1)
-
-
-def load_roads(road_pkl):
-    if road_pkl is None or not os.path.exists(road_pkl):
-        return set(), set()
-    with open(road_pkl, "rb") as f:
-        data = pickle.load(f)
-    return data["road_nodes"], data["road_edges"]
-
-
 # Default obstacles, mirroring Real_Life_Maps/visualization.ipynb.
-DEFAULT_OBSTACLE_SPECS = [
-    ((47, 43), 5, 3),
-    ((30, 36), 3, 5),
-    ((31, 14), 4, 4),
-    ((36, 55), 5, 3),
-    ((14, 17), 4, 4),
-]
-# DEFAULT_OBSTACLE_SPECS = []
+# DEFAULT_OBSTACLE_SPECS = [
+#     ((47, 43), 5, 3),
+#     ((30, 36), 3, 5),
+#     ((31, 14), 4, 4),
+#     ((36, 55), 5, 3),
+#     ((14, 17), 4, 4),
+# ]
+DEFAULT_OBSTACLE_SPECS = []
+
+
+# Default target coordinate pool. `num_targets` selects the first N of these;
+# extend this list to make more targets available.
+DEFAULT_TARGETS = [(14, 54), (1, 29), (33, 17), (34, 35), (63, 37), (37, 5), (49, 58)]
 
 
 
 # ---------------------------------------------------------------------------
-# 4. Multi-agent simulation
+# Multi-agent simulation
 # ---------------------------------------------------------------------------
-
-def _replan(env_map, agents, reward_ratio, obs_discount_factor=1.0,
-            sample_recursion=0, sample_num_obstacle=0, sample_obstacle_hop=0):
-    """Run the greedy assignment and send each agent down its reward-maximizing path.
-
-    sequential_greedy_assignment scores each (agent, target) pair over a set of
-    sampled candidate paths and returns the highest-reward one. We follow that
-    path directly — it is generally NOT the shortest path for a reward-driven
-    policy, so recomputing a shortest path here would discard the planning.
-    """
-    for agent in agents:
-        agent.planned_path = []
-    assignment = sequential_greedy_assignment(
-        env_map, agents, reward_ratio, obs_discount_factor,
-        sample_recursion=sample_recursion,
-        sample_num_obstacle=sample_num_obstacle,
-        sample_obstacle_hop=sample_obstacle_hop,
-        verbose=True,
-    )
-    for i, (target, path) in assignment.items():
-        agents[i].planned_path = list(path) if path else []
-
-
-def _path_blocked_by(path, blocked_pairs):
-    """True if any consecutive pair in `path` is in `blocked_pairs`."""
-    for k in range(len(path) - 1):
-        if (path[k], path[k + 1]) in blocked_pairs or (path[k + 1], path[k]) in blocked_pairs:
-            return True
-    return False
-
 
 def run_multi_agent_simulation(env_graph, blocked_env_graph, source, num_agents,
-                               reward_ratio, obs_discount_factor=1.0,
+                               reward_ratio, target_starts,
+                               obs_discount_factor=1.0,
                                sample_recursion=0, sample_num_obstacle=0,
                                sample_obstacle_hop=0,
+                               target_num_neighbors=4, target_recursion=2,
+                               target_num_obstacles=2, target_obstacle_hop=2,
+                               target_lookahead=10,
                                max_turns=2000, render_dir=None, debug_dir=None):
     """
     Args:
         env_graph: clean planner graph (will be deep-copied for the run).
-        blocked_env_graph: ground-truth graph with ovals applied.
+        blocked_env_graph: ground-truth graph with ovals applied. Targets walk
+            on this graph (their random walk only crosses traversable edges).
         source: starting node for all agents.
         num_agents: number of agents.
         reward_ratio: lambda for path reward.
+        target_starts: list of start nodes, one per target. Each target performs
+            a biased random walk on blocked_env_graph from its start (see
+            Target). The planner sees true positions: every target is stamped
+            onto env_map each observation.
+        target_lookahead: number of steps each target keeps planned ahead.
         max_turns: hard cap to avoid infinite loops on unsolvable realizations.
         render_dir: if set, write one PNG per turn to this directory.
 
@@ -133,6 +92,9 @@ def run_multi_agent_simulation(env_graph, blocked_env_graph, source, num_agents,
     """
     env_map = env_graph.copy()
     agents = [Agent(source) for _ in range(num_agents)]
+    targets = [Target(i, start, blocked_env_graph, lookahead=target_lookahead)
+               for i, start in enumerate(target_starts)]
+    base_type = _snapshot_base_type(env_map)
     replan_times: list[float] = []
     replan_count = 0
 
@@ -140,18 +102,27 @@ def run_multi_agent_simulation(env_graph, blocked_env_graph, source, num_agents,
         if render_dir is None:
             return
         path = os.path.join(render_dir, f"frame_{idx:04d}.png")
-        render_simulation_frame(env_map, blocked_env_graph, agents, idx, path)
+        render_simulation_frame(env_map, blocked_env_graph, agents, idx, path,
+                                targets=targets)
 
     def _maybe_debug_replan(turn_idx):
         if debug_dir is None:
             return
         path = os.path.join(debug_dir, f"replan_{replan_count:04d}_turn{turn_idx:04d}.png")
         render_replan_debug_frame(env_map, blocked_env_graph, agents,
-                                  replan_count, turn_idx, path)
+                                  replan_count, turn_idx, path, targets=targets)
+
+    # Stamp the initial target positions onto the planner map before the first
+    # assignment, then plan and render the opening frame.
+    _sync_targets_to_graph(env_map, targets, base_type)
 
     t0 = time.perf_counter()
     _replan(env_map, agents, reward_ratio, obs_discount_factor,
-            sample_recursion, sample_num_obstacle, sample_obstacle_hop)
+            sample_recursion, sample_num_obstacle, sample_obstacle_hop,
+            source=source, target_num_neighbors=target_num_neighbors,
+            target_recursion=target_recursion,
+            target_num_obstacles=target_num_obstacles,
+            target_obstacle_hop=target_obstacle_hop)
     replan_times.append(time.perf_counter() - t0)
     _maybe_debug_replan(0)
     replan_count += 1
@@ -160,11 +131,10 @@ def run_multi_agent_simulation(env_graph, blocked_env_graph, source, num_agents,
 
     turn = 0
     while turn < max_turns:
-        unreached = [n for n, d in env_map.nodes(data=True) if d.get("type") == "target_unreached"]
-        if not unreached:
+        if all(t.reached for t in targets):
             break
 
-        # --- 1. Observe from each agent's current position ---
+        # --- 1. Observe: reveal blocked edges, then sync target positions ---
         newly_blocked = set()
         for agent in agents:
             observable = set(blocked_env_graph.nodes[agent.position].get("visible_edges", []))
@@ -184,8 +154,19 @@ def run_multi_agent_simulation(env_graph, blocked_env_graph, source, num_agents,
                         e for e in env_map.nodes[node]["visible_edges"] if e not in newly_blocked
                     ]
 
-        # --- 2. Replan triggers ---
-        replan_needed = False
+        # --- 2. Capture check: an agent co-located with a target reaches it ---
+        agent_positions = {a.position for a in agents}
+        captured = False
+        for tgt in targets:
+            if not tgt.reached and tgt.position in agent_positions:
+                tgt.reached = True
+                captured = True
+
+        # Sync the planner's internal map to the (now possibly captured) targets.
+        _sync_targets_to_graph(env_map, targets, base_type)
+
+        # --- 3. Replan triggers ---
+        replan_needed = captured
         if newly_blocked:
             blocked_pairs = set()
             for u, v in newly_blocked:
@@ -196,20 +177,19 @@ def run_multi_agent_simulation(env_graph, blocked_env_graph, source, num_agents,
                     replan_needed = True
                     break
 
-        for agent in agents:
-            if env_map.nodes[agent.position].get("type") == "target_unreached":
-                env_map.nodes[agent.position]["type"] = "target_reached"
-                replan_needed = True
-
         if replan_needed:
             t0 = time.perf_counter()
             _replan(env_map, agents, reward_ratio, obs_discount_factor,
-            sample_recursion, sample_num_obstacle, sample_obstacle_hop)
+                    sample_recursion, sample_num_obstacle, sample_obstacle_hop,
+                    source=source, target_num_neighbors=target_num_neighbors,
+                    target_recursion=target_recursion,
+                    target_num_obstacles=target_num_obstacles,
+                    target_obstacle_hop=target_obstacle_hop)
             replan_times.append(time.perf_counter() - t0)
             _maybe_debug_replan(turn)
             replan_count += 1
 
-        # --- 3. Move each agent up to movement_modifier steps ---
+        # --- 4. Move each agent up to movement_modifier steps, then move targets ---
         any_progress = False
         for agent in agents:
             for _ in range(agent.movement_modifier):
@@ -222,15 +202,19 @@ def run_multi_agent_simulation(env_graph, blocked_env_graph, source, num_agents,
                 agent.move(agent.position, next_node, cost)
                 any_progress = True
 
+        for tgt in targets:
+            tgt.advance()
+
         if not any_progress and not replan_needed:
             break
 
         turn += 1
         _maybe_render(turn)
 
-    completed = not [n for n, d in env_map.nodes(data=True) if d.get("type") == "target_unreached"]
+    completed = all(t.reached for t in targets)
     return {
         "agents": agents,
+        "targets": targets,
         "turns": turn,
         "completed": completed,
         "total_cost": sum(a.total_traversal_cost for a in agents),
@@ -249,7 +233,8 @@ def run_real_map_multi_agent_benchmark(
     road_pkl=None,
     n_size=64,
     source=(0, 0),
-    targets=((14, 54), (1, 29), (33, 17), (34, 35), (63,37), (37,5), (49,58)),
+    targets=DEFAULT_TARGETS,
+    num_targets=None,
     num_agents=2,
     reward_ratio=1.0,
     obs_discount_factor=1.0,
@@ -257,6 +242,7 @@ def run_real_map_multi_agent_benchmark(
     target_recursion=2,
     target_num_obstacles=3,
     target_obstacle_hop=4,
+    target_lookahead=10,
     sample_recursion=4,
     sample_num_obstacle=3,
     sample_obstacle_hop=4,
@@ -270,6 +256,20 @@ def run_real_map_multi_agent_benchmark(
     debug=False,
     debug_dir="./my_policy_simulation/replan_debug",
 ):
+    # Resolve the target set. `targets` is the explicit coordinate pool (the
+    # authoritative start positions); `num_targets` simply takes the first N of
+    # them so the count can be varied without changing positions. An explicit
+    # `targets` list overrides the default pool and, if num_targets is None,
+    # sets the count itself.
+    targets = list(targets)
+    if num_targets is not None:
+        if not 0 < num_targets <= len(targets):
+            raise ValueError(
+                f"num_targets={num_targets} must be in 1..{len(targets)} "
+                f"(the number of available target coordinates)"
+            )
+        targets = targets[:num_targets]
+
     here = os.path.dirname(os.path.abspath(__file__))
     output_csv_path = os.path.join(here, output_csv)
     output_json_path = os.path.join(here, output_json)
@@ -360,14 +360,22 @@ def run_real_map_multi_agent_benchmark(
         clear_debug_dir(debug_path)
         print(f"Saving replan-debug frames to {debug_path}")
 
+    # Each target performs a biased random walk on the ground-truth graph from
+    # its coordinate, planning `target_lookahead` steps ahead (see Target).
     print(f"\nRunning {num_agents} agents")
     t0 = time.perf_counter()
     result = run_multi_agent_simulation(
         env_graph, blocked_env_graph, source, num_agents, reward_ratio,
+        list(targets),
         obs_discount_factor=obs_discount_factor,
         sample_recursion=sample_recursion,
         sample_num_obstacle=sample_num_obstacle,
         sample_obstacle_hop=sample_obstacle_hop,
+        target_num_neighbors=target_num_neighbors,
+        target_recursion=target_recursion,
+        target_num_obstacles=target_num_obstacles,
+        target_obstacle_hop=target_obstacle_hop,
+        target_lookahead=target_lookahead,
         render_dir=render_path,
         debug_dir=debug_path,
     )
@@ -438,6 +446,9 @@ def main():
     parser.add_argument("--dem-path", type=str, default=None)
     parser.add_argument("--road-pkl", type=str, default=None)
     parser.add_argument("--grid-size", type=int, default=64)
+    parser.add_argument("--num-targets", type=int, default=None,
+                        help="Use the first N coordinates from the target pool. "
+                             "Omit to use all of them.")
     parser.add_argument("--num-agents", type=int, default=2)
     parser.add_argument("--output", type=str, default="./my_policy_simulation/real_map_ma_results.csv")
     parser.add_argument("--output-summary", type=str, default="./my_policy_simulation/real_map_ma_summary.json")
@@ -450,7 +461,16 @@ def main():
                         help="On every replan, save a separate frame overlaying all "
                              "(agent, target) shortest paths as dashed lines.")
     parser.add_argument("--debug-dir", type=str, default="./my_policy_simulation/replan_debug")
+    parser.add_argument("--seed", type=int, default=42,
+                        help="Seed for random and numpy RNGs (target trajectories, "
+                             "diverse-path sampling). Set once here for reproducibility.")
     args = parser.parse_args()
+
+    # Seed both RNGs once, up front. The target random walks and the
+    # diverse-path sampler both draw from these, so this makes a run
+    # reproducible (see CLAUDE.md seeding convention).
+    random.seed(args.seed)
+    np.random.seed(args.seed)
 
     here = os.path.dirname(os.path.abspath(__file__))
     real_maps_dir = os.path.join(project_root, "Real_Life_Maps")
@@ -471,6 +491,7 @@ def main():
     target_recursion = 2
     target_num_obstacles = 3
     target_obstacle_hop = 4
+    target_lookahead = 10
     sample_recursion = 2
     sample_num_obstacle = 3
     sample_obstacle_hop = 4
@@ -479,6 +500,7 @@ def main():
         dem_path=args.dem_path,
         road_pkl=args.road_pkl,
         n_size=args.grid_size,
+        num_targets=args.num_targets,
         num_agents=args.num_agents,
         reward_ratio=reward_ratio,
         obs_discount_factor=obs_discount_factor,
@@ -486,6 +508,7 @@ def main():
         target_recursion=target_recursion,
         target_num_obstacles=target_num_obstacles,
         target_obstacle_hop=target_obstacle_hop,
+        target_lookahead=target_lookahead,
         sample_recursion=sample_recursion,
         sample_num_obstacle=sample_num_obstacle,
         sample_obstacle_hop=sample_obstacle_hop,

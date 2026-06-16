@@ -12,6 +12,7 @@ wheels/
 
 # Claude Code
 .Claude
+CLAUDE.md
 
 # Cache
 *.cache/

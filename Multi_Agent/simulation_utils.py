@@ -1,196 +1,271 @@
 """
-Visualization helpers for the multi-agent simulation.
+Auxiliary (non-rendering) helpers for the multi-agent simulation.
 
-Mirrors the rendering rules used in Real_Life_Maps/visualization.ipynb:
-- terrain by height, obstacles in black, road edges in dark grey
-- source = green circle, target_unreached = red X, target_reached = grey X
-- each agent gets a single color; solid line = trajectory so far,
-  dotted line = planned path
+Split out of multi_agent_simulation.py to keep the driver focused on the turn
+loop and benchmark plumbing. Three groups live here:
+
+- DEM + road loading: read the terrain raster and the road pickle off disk.
+- Planning: `_replan` runs the greedy assignment and routes each agent down its
+  scored path; `_recompute_num_used` refreshes the edge `num_used` weights
+  against the planner's current map and the targets' current positions before
+  each replan.
+- Target bookkeeping: the `Target` class (a biased random walk with look-ahead
+  planning), plus `_snapshot_base_type` / `_sync_targets_to_graph`, which
+  project the moving Target objects onto the planner's internal map via the
+  node `type` attribute the assignment code reads.
+
+Rendering helpers live in rendering_utils.py.
 """
 import os
-import subprocess
-from pathlib import Path
+import sys
+import pickle
 
-import matplotlib.pyplot as plt
-import matplotlib.colors as mcolors
-import matplotlib.patches as patches
-import matplotlib.collections as mc
-import networkx as nx
+import numpy as np
 
+project_root = os.path.abspath(os.path.join(os.path.dirname(__file__), ".."))
+if project_root not in sys.path:
+    sys.path.insert(0, project_root)
 
-DEFAULT_AGENT_COLORS = ["blue", "red", "green"]
-
-
-def _agent_color(idx, agent_colors=None):
-    colors = agent_colors if agent_colors is not None else DEFAULT_AGENT_COLORS
-    if idx < len(colors):
-        return colors[idx]
-    return plt.cm.tab10(idx % 10)
+from Graph_Generation.target_graph import create_fully_connected_target_graph
+from Multi_Agent.finite_horizon_MA import sequential_greedy_assignment
 
 
-def render_simulation_frame(env_map, blocked_env_graph, agents, turn_idx, output_path,
-                            agent_colors=None, title=None, extra_paths=None):
-    """Render one frame of the multi-agent simulation to PNG.
+# ---------------------------------------------------------------------------
+# DEM + road loading
+# ---------------------------------------------------------------------------
 
-    Args:
-        env_map: planner's view of the graph (used for target_reached state).
-        blocked_env_graph: ground-truth graph (used for terrain, obstacles, roads).
-        agents: list of Agent instances (each with .position, .trajectory, .planned_path).
-        turn_idx: integer turn number — used in title and filename ordering.
-        output_path: absolute path to write the PNG.
-        agent_colors: optional list of matplotlib colors per agent.
-        title: optional title override (default "Turn N").
-        extra_paths: optional list of (path, color, linestyle, linewidth) tuples to
-            overlay before agent markers. Used by the replan-debug renderer to
-            show every candidate (agent, target) shortest path.
+def get_grid_from_local_dem(file_path, n_size):
+    import rasterio
+    from rasterio.enums import Resampling
+
+    with rasterio.open(file_path) as dataset:
+        data = dataset.read(
+            1, out_shape=(n_size, n_size), resampling=Resampling.bilinear
+        )
+        if dataset.nodata is not None:
+            data = np.where(data == dataset.nodata, np.nan, data)
+        return data
+
+
+def load_real_terrain(dem_path, n_size=64):
+    height_grid = get_grid_from_local_dem(dem_path, n_size)
+    return np.rot90(height_grid, k=-1)
+
+
+def load_roads(road_pkl):
+    if road_pkl is None or not os.path.exists(road_pkl):
+        return set(), set()
+    with open(road_pkl, "rb") as f:
+        data = pickle.load(f)
+    return data["road_nodes"], data["road_edges"]
+
+
+# ---------------------------------------------------------------------------
+# Target: biased random walk with look-ahead planning
+# ---------------------------------------------------------------------------
+
+# Cardinal moves on the grid graph, as (dr, dc) deltas.
+CARDINAL_DIRECTIONS = [(1, 0), (-1, 0), (0, 1), (0, -1)]
+
+
+class Target:
+    """A target that performs a biased random walk on the ground-truth graph.
+
+    Per-step movement model, relative to the direction of the last move:
+      - 0.5  continue forward (same direction),
+      - 0.25 turn to each side (the two perpendicular directions).
+    Reversing is never chosen. The very first step has no established direction,
+    so it picks uniformly among the valid neighbours.
+
+    Moves that leave the map or cross a missing/blocked edge are dropped and the
+    remaining valid actions are re-weighted — equivalent to "resample until the
+    action is valid", but without the risk of looping. If no forward/side move
+    is valid (a dead end) the target reverses; if even that is blocked it stays.
+
+    The next `lookahead` steps are kept planned at all times: that many are
+    pre-sampled on construction, and one more is sampled each time the target
+    advances. `position` and `reached` are the simulation's source of truth; the
+    planner discovers the target via the node `type` it gets stamped onto the
+    planner map (see _sync_targets_to_graph).
     """
-    pos = nx.get_node_attributes(blocked_env_graph, 'pos')
-    all_heights = [d.get('height', 0) for _, d in blocked_env_graph.nodes(data=True)]
-    max_height = max(all_heights) if all_heights else 1
-    norm = mcolors.Normalize(vmin=0, vmax=max_height + 1)
-    cmap_terrain = plt.cm.terrain
 
-    xs = sorted(set(p[0] for p in pos.values()))
-    ys = sorted(set(p[1] for p in pos.values()))
-    cell_w = xs[1] - xs[0]
-    cell_h = ys[1] - ys[0]
+    def __init__(self, target_id, start, graph, lookahead=10):
+        self.id = target_id
+        self.graph = graph
+        self.lookahead = lookahead
+        self.position = start
+        self.direction = None          # (dr, dc) of the last move taken
+        self.reached = False
+        self.history = [start]         # positions actually visited
+        self.planned = []              # upcoming positions; planned[0] is next
+        # Planning frontier: the position/direction at the tip of `planned`, so
+        # further steps can be sampled without disturbing the live position.
+        self._frontier_pos = start
+        self._frontier_dir = None
+        self._extend_plan()
 
-    fig, ax = plt.subplots(figsize=(10, 10))
+    def _is_valid(self, pos, direction):
+        """True if stepping `direction` from `pos` crosses a traversable edge."""
+        nxt = (pos[0] + direction[0], pos[1] + direction[1])
+        return self.graph.has_node(nxt) and self.graph.has_edge(pos, nxt)
 
-    for node, data in blocked_env_graph.nodes(data=True):
-        x, y = pos[node]
-        if data.get("type") == "obstacle":
-            color = "black"
-        else:
-            color = cmap_terrain(norm(data.get('height', 0)))
-        ax.add_patch(patches.Rectangle(
-            (x - cell_w / 2, y - cell_h / 2), cell_w, cell_h,
-            linewidth=0, facecolor=color
-        ))
+    def _sample_direction(self, pos, direction):
+        """Pick the next direction from `pos` given the incoming `direction`.
 
-    road_segments = [[pos[u], pos[v]] for u, v, d in blocked_env_graph.edges(data=True) if d.get('is_road')]
-    if road_segments:
-        ax.add_collection(mc.LineCollection(road_segments, colors='#404040', linewidths=2.0, zorder=4))
+        Returns a (dr, dc) delta, or None if `pos` has no traversable neighbour.
+        """
+        if direction is None:
+            choices = [d for d in CARDINAL_DIRECTIONS if self._is_valid(pos, d)]
+            if not choices:
+                return None
+            return choices[int(np.random.randint(len(choices)))]
 
-    for i, agent in enumerate(agents):
-        color = _agent_color(i, agent_colors)
-        if len(agent.trajectory) >= 2:
-            traj_segments = [[pos[agent.trajectory[k]], pos[agent.trajectory[k + 1]]]
-                             for k in range(len(agent.trajectory) - 1)]
-            ax.add_collection(mc.LineCollection(traj_segments, colors=color, linewidths=4.0, zorder=5))
-        if len(agent.planned_path) >= 2:
-            plan_segments = [[pos[agent.planned_path[k]], pos[agent.planned_path[k + 1]]]
-                             for k in range(len(agent.planned_path) - 1)]
-            ax.add_collection(mc.LineCollection(plan_segments, colors=color, linewidths=3.2,
-                                                zorder=6, linestyles='dotted'))
+        forward = direction
+        left = (-direction[1], direction[0])
+        right = (direction[1], -direction[0])
+        weighted = [(forward, 0.5), (left, 0.25), (right, 0.25)]
+        valid = [(d, w) for d, w in weighted if self._is_valid(pos, d)]
+        if valid:
+            dirs, weights = zip(*valid)
+            total = sum(weights)
+            probs = [w / total for w in weights]
+            return dirs[int(np.random.choice(len(dirs), p=probs))]
 
-    if extra_paths:
-        for path, color, linestyle, linewidth in extra_paths:
-            if path is None or len(path) < 2:
-                continue
-            segs = [[pos[path[k]], pos[path[k + 1]]] for k in range(len(path) - 1)]
-            ax.add_collection(mc.LineCollection(
-                segs, colors=color, linewidths=linewidth,
-                zorder=4, linestyles=linestyle, alpha=0.7,
-            ))
+        # Dead end: no forward/side move. Reverse if possible, else stay put.
+        back = (-direction[0], -direction[1])
+        return back if self._is_valid(pos, back) else None
 
-    src_pts, unreached_pts, reached_pts = [], [], []
-    for node, data in env_map.nodes(data=True):
-        t = data.get("type")
-        if t == "source":
-            src_pts.append(pos[node])
-        elif t == "target_unreached":
-            unreached_pts.append(pos[node])
-        elif t == "target_reached":
-            reached_pts.append(pos[node])
+    def _extend_plan(self):
+        """Refill `planned` up to `lookahead` upcoming steps."""
+        while len(self.planned) < self.lookahead:
+            d = self._sample_direction(self._frontier_pos, self._frontier_dir)
+            if d is None:
+                break  # stuck: cannot plan any further from here
+            nxt = (self._frontier_pos[0] + d[0], self._frontier_pos[1] + d[1])
+            self.planned.append(nxt)
+            self._frontier_pos = nxt
+            self._frontier_dir = d
 
-    if src_pts:
-        ax.scatter([p[0] for p in src_pts], [p[1] for p in src_pts],
-                   marker='o', s=220, facecolor='limegreen', edgecolor='darkgreen',
-                   linewidths=1.5, zorder=10)
-    if unreached_pts:
-        ax.scatter([p[0] for p in unreached_pts], [p[1] for p in unreached_pts],
-                   marker='x', s=200, color='red', linewidths=3, zorder=10)
-    if reached_pts:
-        ax.scatter([p[0] for p in reached_pts], [p[1] for p in reached_pts],
-                   marker='x', s=200, color='grey', linewidths=3, zorder=10)
+    def advance(self):
+        """Move to the next planned node and sample one more (no-op if reached)."""
+        if self.reached or not self.planned:
+            return
+        nxt = self.planned.pop(0)
+        self.direction = (nxt[0] - self.position[0], nxt[1] - self.position[1])
+        self.position = nxt
+        self.history.append(nxt)
+        self._extend_plan()
 
-    for i, agent in enumerate(agents):
-        color = _agent_color(i, agent_colors)
-        x, y = pos[agent.position]
-        ax.scatter([x], [y], marker='o', s=130, facecolor=color, edgecolor='black',
-                   linewidths=1.2, zorder=11)
+# ---------------------------------------------------------------------------
+# Planning: assignment + num_used recompute
+# ---------------------------------------------------------------------------
 
-    ax.set_xlim(xs[0] - cell_w / 2, xs[-1] + cell_w / 2)
-    ax.set_ylim(ys[0] - cell_h / 2, ys[-1] + cell_h / 2)
-    ax.set_aspect('equal')
-    ax.axis('off')
-    plt.title(title if title is not None else f"Turn {turn_idx}")
-    plt.tight_layout()
-    os.makedirs(os.path.dirname(output_path), exist_ok=True)
-    plt.savefig(output_path, dpi=100, bbox_inches='tight')
-    plt.close(fig)
+def _recompute_num_used(env_map, source, target_num_neighbors, target_recursion,
+                        target_num_obstacles, target_obstacle_hop):
+    """Refresh the `num_used` edge attribute on env_map for the current state.
 
+    `num_used` measures how heavily each edge is used across the diverse paths
+    connecting the source to the remaining targets, and the path reward reads
+    it. Targets now move, so the set of unreached targets — and hence the paths
+    between them — changes every replan; recomputing here rebuilds `num_used`
+    against the planner's current map and the targets' current positions.
 
-def clear_frame_dir(frames_dir):
-    """Delete existing frame_*.png from frames_dir (creates the dir if absent)."""
-    p = Path(frames_dir)
-    p.mkdir(parents=True, exist_ok=True)
-    for f in p.glob("frame_*.png"):
-        f.unlink()
-
-
-def clear_debug_dir(debug_dir):
-    """Delete existing replan_*.png from debug_dir (creates the dir if absent)."""
-    p = Path(debug_dir)
-    p.mkdir(parents=True, exist_ok=True)
-    for f in p.glob("replan_*.png"):
-        f.unlink()
-
-
-def render_replan_debug_frame(env_map, blocked_env_graph, agents, replan_idx,
-                              turn_idx, output_path, agent_colors=None):
-    """Render a debug frame showing every (agent, remaining target) shortest path
-    as a dashed line in the agent's color, on top of the regular simulation view.
-
-    Saved separately from the MP4 frames.
+    create_fully_connected_target_graph resets `num_used` to 0 internally, but
+    it *appends* to each node's `stored_path_contributions` list without
+    resetting it. That attribute is unused by the multi-agent reward, but the
+    lists would otherwise grow without bound across replans, so we clear them
+    first.
     """
-    import networkx as nx  # local to keep module-level lazy
-
-    targets = [
-        n for n, d in env_map.nodes(data=True) if d.get("type") == "target_unreached"
-    ]
-    extras = []
-    for i, agent in enumerate(agents):
-        color = _agent_color(i, agent_colors)
-        for t in targets:
-            try:
-                path = nx.shortest_path(env_map, agent.position, t, weight="distance")
-            except (nx.NetworkXNoPath, nx.NodeNotFound):
-                continue
-            extras.append((path, color, "dashed", 2.0))
-
-    title = f"Replan #{replan_idx} @ turn {turn_idx} ({len(targets)} targets remaining)"
-    render_simulation_frame(
-        env_map, blocked_env_graph, agents, turn_idx, output_path,
-        agent_colors=agent_colors, title=title, extra_paths=extras,
+    unreached = [n for n, d in env_map.nodes(data=True)
+                 if d.get("type") == "target_unreached"]
+    if not unreached:
+        return
+    for n in env_map.nodes():
+        if "stored_path_contributions" in env_map.nodes[n]:
+            env_map.nodes[n]["stored_path_contributions"] = []
+    create_fully_connected_target_graph(
+        env_map, source=source, targets=unreached,
+        num_neighbors=target_num_neighbors,
+        recursions=target_recursion,
+        num_obstacles=target_num_obstacles,
+        obstacle_hop=target_obstacle_hop,
     )
 
 
-def make_mp4_from_frames(frames_dir, output_mp4, fps=4):
-    """Combine frame_*.png in frames_dir into an MP4 at the given fps via ffmpeg."""
-    frames = sorted(Path(frames_dir).glob("frame_*.png"))
-    if not frames:
-        return None
-    pattern = str(Path(frames_dir) / "frame_%04d.png")
-    Path(output_mp4).parent.mkdir(parents=True, exist_ok=True)
-    cmd = [
-        "ffmpeg", "-y",
-        "-framerate", str(fps),
-        "-i", pattern,
-        "-c:v", "libx264",
-        "-pix_fmt", "yuv420p",
-        str(output_mp4),
-    ]
-    subprocess.run(cmd, check=True, capture_output=True)
-    return output_mp4
+def _replan(env_map, agents, reward_ratio, obs_discount_factor=1.0,
+            sample_recursion=0, sample_num_obstacle=0, sample_obstacle_hop=0,
+            source=None, target_num_neighbors=4, target_recursion=2,
+            target_num_obstacles=2, target_obstacle_hop=2):
+    """Run the greedy assignment and send each agent down its reward-maximizing path.
+
+    Before scoring, the `num_used` edge values are recomputed against the
+    current map and the targets' current positions, since the path reward reads
+    `num_used` and the values go stale as targets move and obstacles are
+    discovered. See _recompute_num_used. (Skipped when source is None.)
+
+    sequential_greedy_assignment scores each (agent, target) pair over a set of
+    sampled candidate paths and returns the highest-reward one. We follow that
+    path directly — it is generally NOT the shortest path for a reward-driven
+    policy, so recomputing a shortest path here would discard the planning.
+    """
+    if source is not None:
+        _recompute_num_used(env_map, source, target_num_neighbors,
+                            target_recursion, target_num_obstacles,
+                            target_obstacle_hop)
+    for agent in agents:
+        agent.planned_path = []
+    assignment = sequential_greedy_assignment(
+        env_map, agents, reward_ratio, obs_discount_factor,
+        sample_recursion=sample_recursion,
+        sample_num_obstacle=sample_num_obstacle,
+        sample_obstacle_hop=sample_obstacle_hop,
+        verbose=True,
+    )
+    for i, (target, path) in assignment.items():
+        agents[i].planned_path = list(path) if path else []
+
+
+def _path_blocked_by(path, blocked_pairs):
+    """True if any consecutive pair in `path` is in `blocked_pairs`."""
+    for k in range(len(path) - 1):
+        if (path[k], path[k + 1]) in blocked_pairs or (path[k + 1], path[k]) in blocked_pairs:
+            return True
+    return False
+
+
+# ---------------------------------------------------------------------------
+# Planner-map sync for moving targets
+# ---------------------------------------------------------------------------
+
+def _snapshot_base_type(graph):
+    """Record each node's non-target base type so target stamps can be undone.
+
+    Original `target_*` markers (e.g. from RealTerrainGrid) collapse to
+    'intermediate' — target placement is now driven entirely by Target objects.
+    """
+    base = {}
+    for node, d in graph.nodes(data=True):
+        t = d.get("type")
+        base[node] = "intermediate" if t in ("target_unreached", "target_reached") else t
+    return base
+
+
+def _sync_targets_to_graph(graph, targets, base_type):
+    """Project the (observed) Target positions onto the planner's internal map.
+
+    The planner enumerates targets by scanning for node type 'target_unreached',
+    so this is how Target objects become visible to the assignment code. Called
+    during the observation stage. The planner sees true positions for now, so
+    every target is stamped; partial target observability would stamp only the
+    targets currently sighted by some agent.
+    """
+    # Undo previous target stamps, restoring each node's base (non-target) type.
+    for node, d in graph.nodes(data=True):
+        if d.get("type") in ("target_unreached", "target_reached"):
+            d["type"] = base_type.get(node, "intermediate")
+    # Stamp current target positions; never clobber the source marker.
+    for tgt in targets:
+        node = tgt.position
+        if graph.nodes[node].get("type") == "source":
+            continue
+        graph.nodes[node]["type"] = "target_reached" if tgt.reached else "target_unreached"
