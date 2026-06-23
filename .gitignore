@@ -21,4 +21,4 @@ CLAUDE.md
 *.DS_Store
 
 # Outputs
-Mutli_Agents/my_policy_simulation/
+Multi_Agent/my_policy_simulation/
