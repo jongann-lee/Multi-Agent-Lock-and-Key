@@ -5,7 +5,7 @@ build/
 dist/
 wheels/
 *.egg-info
-#.python-version
+.python-version
 
 # Virtual environments
 .venv
@@ -14,7 +14,12 @@ wheels/
 .Claude
 
 # Cache
-*.cache/
+cache/
 
 # Mac OS
 *.DS_Store
+
+# Simulation Results
+Multi_Agent/my_policy_simulation/
+
+
