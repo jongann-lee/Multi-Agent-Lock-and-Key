@@ -15,7 +15,7 @@ wheels/
 CLAUDE.md
 
 # Cache
-*.cache/
+cache/
 
 # Mac OS
 *.DS_Store
