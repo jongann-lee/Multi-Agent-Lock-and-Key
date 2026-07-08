@@ -11,16 +11,24 @@ from scipy.optimize import linear_sum_assignment
 
 from Single_Agent.repeated_topk import calculate_path_reward
 from Graph_Generation.target_graph import stochastic_accumulated_blockage_path
+from Multi_Agent.rps import ROCK, COMBAT_TYPES
 
 
 UNREACHABLE_REWARD = -1e9
 
 
 class Agent:
-    def __init__(self, position, cost_multiplier: float = 1.0, movement_modifier: int = 1):
+    def __init__(self, position, agent_type: int = ROCK,
+                 cost_multiplier: float = 1.0, movement_modifier: int = 1):
         """
         Args:
             position: starting node.
+            agent_type: one of the rps ids (SCOUT=0, ROCK=1, SCISSOR=2,
+                PAPER=3). Scouts have long-range visibility but cannot engage
+                targets; rock/scissor/paper can engage but are blind (sense
+                nothing), learning a target's type only by stepping onto it.
+                See Multi_Agent/rps.py. Defaults to ROCK so legacy callers that
+                ignore types still get a valid combat agent.
             cost_multiplier: per-agent multiplier on edge cost. The graph's
                 edge 'distance' gets multiplied by this when accumulated into
                 total_traversal_cost (and when scoring path rewards).
@@ -28,13 +36,22 @@ class Agent:
                 traverse per simulation turn.
         """
         self.position = position
+        self.agent_type = int(agent_type)
+        self.alive = True
         self.cost_multiplier = float(cost_multiplier)
         self.movement_modifier = int(movement_modifier)
         self.total_traversal_cost = 0.0
         self.trajectory = [position]
         self.planned_path: list = []
 
+    @property
+    def can_engage(self) -> bool:
+        """True for rock/scissor/paper agents; False for scouts."""
+        return self.agent_type in COMBAT_TYPES
+
     def move(self, from_node, to_node, cost: float):
+        if not self.alive:
+            return
         if from_node != self.position:
             raise ValueError(
                 f"Agent is at {self.position} but move() was called with from_node={from_node}"
