@@ -1,11 +1,11 @@
 """
 Map-agnostic Rock-Scissor-Paper simulation core.
 
-This is the turn-based driver for the `rock_scissor_paper` direction. It is
-deliberately decoupled from the real-DEM benchmark so the mechanics can be
-exercised on a tiny synthetic graph in a fast unit test (see test_rps.py). The
-real-map entry point (rps_real_map.py) just builds the two graphs and hands
-them here.
+This is the continuous-time, discrete-event driver for the `rock_scissor_paper`
+direction. It is deliberately decoupled from the real-DEM benchmark so the
+mechanics can be exercised on a tiny synthetic graph in a fast unit test (see
+test_rps.py). The real-map entry point (rps_real_map.py) just builds the two
+graphs and hands them here.
 
 Two-graph partial observability (same contract as the base multi-agent sim):
   * ``env_map``      -- the planner's view. Targets start with
@@ -26,15 +26,24 @@ What this module adds on top of the base loop:
      eliminates the target, a losing one dies, a draw leaves both in place,
      and a scout always dies. Every encounter reveals the target's type.
   3. **Deaths.** A dead agent is removed from play for the rest of the run.
+  4. **Continuous time (discrete-event simulation).** An edge of cost c takes
+     time c to traverse; the loop jumps between agent-arrival *events* via a
+     time-ordered heap instead of stepping fixed ticks, so traversal cost is
+     reflected directly in elapsed time and *waiting is no longer free*. The
+     objective is the **makespan** (clock time of the last elimination) plus a
+     death penalty. An agent commits to its current edge and is re-planned when
+     it reaches the next node; observation happens at node arrivals.
 
 The assignment policy is pluggable: pass any ``policy(env_map, agents, ...)``
-that sets each living agent's ``planned_path``. ``naive_type_aware_replan``
-below is a minimal SAFE placeholder so the loop runs; replace it with the real
-baseline.
+that sets each agent's ``planned_path``. On each event the policy is called
+with the living, *at-a-node* agents only (in-transit agents are committed to
+their current edge until they arrive). ``naive_type_aware_replan`` below is a
+minimal SAFE placeholder so the loop runs; replace it with the real baseline.
 """
 
 import sys
 import os
+import heapq
 
 project_root = os.path.abspath(os.path.join(os.path.dirname(__file__), ".."))
 if project_root not in sys.path:
@@ -64,14 +73,6 @@ def _path_distance(graph, path):
         graph.edges[path[k], path[k + 1]]["distance"]
         for k in range(len(path) - 1)
         if graph.has_edge(path[k], path[k + 1])
-    )
-
-
-def _path_hits_blocked(path, blocked_keys):
-    """True if any consecutive pair in ``path`` is a newly blocked edge."""
-    return any(
-        _ekey(path[k], path[k + 1]) in blocked_keys
-        for k in range(len(path) - 1)
     )
 
 
@@ -115,7 +116,7 @@ def sensed_nodes_truth(ground_truth, agent):
 # Observation: blockage discovery + target-type revelation.
 # ---------------------------------------------------------------------------
 
-def observe_and_reveal(env_map, ground_truth, agents, events=None, turn=0,
+def observe_and_reveal(env_map, ground_truth, agents, events=None, time=0.0,
                        verbose=False):
     """Each living agent observes from its position.
 
@@ -152,7 +153,7 @@ def observe_and_reveal(env_map, ground_truth, agents, events=None, turn=0,
             env_map.nodes[node]["rps_type"] = true_type
             revealed += 1
             if events is not None:
-                events.append({"turn": turn, "event": "reveal", "agent": idx,
+                events.append({"time": time, "event": "reveal", "agent": idx,
                                "node": node, "rps_type": true_type})
             if verbose:
                 print(f"  [reveal] agent {idx} ({TYPE_NAMES[agent.agent_type]}) "
@@ -181,7 +182,7 @@ def observe_and_reveal(env_map, ground_truth, agents, events=None, turn=0,
 # ---------------------------------------------------------------------------
 
 def resolve_combat_on_arrival(env_map, ground_truth, agent, agent_idx, node,
-                              events=None, turn=0, verbose=False):
+                              events=None, time=0.0, verbose=False):
     """Resolve an encounter for ``agent`` that just stepped onto live ``node``.
 
     Always reveals the target's type. Returns the outcome string
@@ -200,7 +201,7 @@ def resolve_combat_on_arrival(env_map, ground_truth, agent, agent_idx, node,
         agent.alive = False
 
     if events is not None:
-        events.append({"turn": turn, "event": outcome, "agent": agent_idx,
+        events.append({"time": time, "event": outcome, "agent": agent_idx,
                        "node": node, "agent_type": agent.agent_type,
                        "rps_type": true_type})
     if verbose:
@@ -324,116 +325,155 @@ def naive_type_aware_replan(env_map, agents, reward_ratio=1.0,
 def run_rps_simulation(env_map, ground_truth, agents, policy=None,
                        reward_ratio=1.0, obs_discount_factor=1.0,
                        sample_recursion=0, sample_num_obstacle=0,
-                       sample_obstacle_hop=0, max_turns=2000, verbose=False,
-                       render_dir=None):
-    """Run the RPS simulation until all targets are cleared or it stalls.
+                       sample_obstacle_hop=0, death_penalty=100.0,
+                       max_events=100000, verbose=False,
+                       render_dir=None, render_dt=1.0):
+    """Run the RPS simulation in continuous time until all targets are cleared
+    or the team stalls.
+
+    Discrete-event: traversing an edge of cost c takes time c. The loop pops the
+    next agent-arrival from a time-ordered heap, advances the clock to it,
+    observes / resolves combat at that node, re-plans the living at-a-node agents
+    (in-transit agents are committed to their current edge and re-planned only
+    when they arrive), and re-schedules moves. Waiting therefore costs real time
+    and shows up in the makespan.
 
     Args:
         env_map: planner view (copied internally; targets carry UNKNOWN types).
-        ground_truth: reality (true edges, true target ``rps_type``).
+        ground_truth: reality (true edges + edge ``distance``, true target
+            ``rps_type``); edge distance doubles as traversal time.
         agents: list of Agent (typed, all positioned at the source).
-        policy: ``policy(env_map, living_agents, **kwargs)`` that sets each
-            living agent's ``planned_path``. Defaults to
+        policy: ``policy(env_map, at_node_living_agents, **kwargs)`` that sets
+            each passed agent's ``planned_path``. Defaults to
             :func:`naive_type_aware_replan`.
-        max_turns: hard cap against non-terminating realizations.
+        death_penalty: added to the objective per dead agent (a tunable knob, in
+            makespan time-units).
+        max_events: safety cap on processed arrivals.
+        render_dir: if set, write interpolated PNG frames spaced ``render_dt``
+            apart in time.
 
-    Returns a result dict with per-agent costs/survival, turn count,
-    completion, remaining/eliminated targets, and the event log.
+    Returns a result dict including ``makespan`` (clock of the last elimination,
+    or of termination if incomplete), ``objective`` (= makespan +
+    death_penalty * num_deaths), completion, remaining/eliminated targets,
+    per-agent traversal cost, deaths/survivors, and the time-stamped event log.
     """
     policy = policy or naive_type_aware_replan
     env_map = env_map.copy()
     events = []
-
-    def living():
-        return [a for a in agents if a.alive]
+    n = len(agents)
+    transit = [None] * n            # transit[i] = (u, v, depart_t, arrive_t) or None
+    heap = []                       # entries: (arrive_t, agent_idx)
+    clock = 0.0
+    pos = nx.get_node_attributes(ground_truth, "pos")
 
     def do_replan():
-        policy(env_map, living(), reward_ratio=reward_ratio,
+        # Only living, at-a-node agents are (re)planned; in-transit agents are
+        # committed to their current edge until they arrive.
+        planners = [a for i, a in enumerate(agents)
+                    if a.alive and transit[i] is None]
+        policy(env_map, planners, reward_ratio=reward_ratio,
                obs_discount_factor=obs_discount_factor,
                sample_recursion=sample_recursion,
                sample_num_obstacle=sample_num_obstacle,
                sample_obstacle_hop=sample_obstacle_hop, verbose=verbose)
 
-    def _maybe_render(idx):
+    def schedule(i):
+        """Commit at-a-node agent i to the next edge of its plan (push an
+        arrival event). No-op if it's dead, already moving, has no next step,
+        or that edge is blocked in reality (then it idles until re-planned)."""
+        a = agents[i]
+        if not a.alive or transit[i] is not None or len(a.planned_path) < 2:
+            return
+        u, v = a.position, a.planned_path[1]
+        if a.planned_path[0] != u or not ground_truth.has_edge(u, v):
+            return
+        arrive = clock + ground_truth.edges[u, v]["distance"]  # cost == time
+        transit[i] = (u, v, clock, arrive)
+        heapq.heappush(heap, (arrive, i))
+
+    def targets_remain():
+        return any(d.get("type") == "target_unreached"
+                   for _, d in env_map.nodes(data=True))
+
+    # --- rendering: interpolated fixed-dt sampling of the continuous timeline ---
+    render_state = {"frame": 0, "next_t": 0.0}
+
+    def _interp_xy(i, tau):
+        tr = transit[i]
+        if tr is None:
+            return pos[agents[i].position]
+        u, v, dep, arr = tr
+        frac = 0.0 if arr <= dep else max(0.0, min(1.0, (tau - dep) / (arr - dep)))
+        (x0, y0), (x1, y1) = pos[u], pos[v]
+        return (x0 + frac * (x1 - x0), y0 + frac * (y1 - y0))
+
+    def emit_frame(tau):
         if render_dir is None:
             return
         from Multi_Agent.simulation_utils import render_rps_frame  # lazy (matplotlib)
-        render_rps_frame(env_map, ground_truth, agents, idx,
-                         os.path.join(render_dir, f"frame_{idx:04d}.png"))
+        xys = [_interp_xy(i, tau) for i in range(n)]
+        render_rps_frame(
+            env_map, ground_truth, agents, render_state["frame"],
+            os.path.join(render_dir, f"frame_{render_state['frame']:04d}.png"),
+            agent_xy=xys, title=f"t = {tau:.1f}")
+        render_state["frame"] += 1
 
-    do_replan()  # initial plan
-    _maybe_render(0)
+    # --- initialize: observe from the source, plan, schedule, first frame ---
+    observe_and_reveal(env_map, ground_truth,
+                       [a for a in agents if a.alive], events, clock, verbose)
+    do_replan()
+    for i in range(n):
+        schedule(i)
+    emit_frame(0.0)
+    render_state["next_t"] = render_dt
 
-    turn = 0
-    while turn < max_turns:
-        live_targets = [n for n, d in env_map.nodes(data=True)
-                        if d.get("type") == "target_unreached"]
-        if not live_targets:
-            break  # success: everything cleared
-        if not living():
-            break  # all agents dead
+    processed = 0
+    while heap and targets_remain() and processed < max_events:
+        t_next = heap[0][0]
+        # Emit interpolated frames for sample times strictly before the event.
+        if render_dir is not None:
+            while render_state["next_t"] < t_next:
+                emit_frame(render_state["next_t"])
+                render_state["next_t"] += render_dt
 
-        # --- 1. Observe (blockage discovery + type revelation) ---
-        newly_blocked, revealed = observe_and_reveal(env_map, ground_truth,
-                                                     agents, events, turn, verbose)
+        arrive_t, i = heapq.heappop(heap)
+        clock = arrive_t
+        processed += 1
+        a = agents[i]
+        u, v, _dep, _arr = transit[i]
+        transit[i] = None
+        a.move(u, v, ground_truth.edges[u, v]["distance"])  # -> position=v, cost, trim plan
 
-        # --- 2. Replan on new information: a freshly revealed target type, or
-        #        a discovered blockage that hits some agent's planned path. ---
-        replanned = False
-        blockage_replan = bool(newly_blocked) and any(
-            len(a.planned_path) >= 2 and _path_hits_blocked(a.planned_path, newly_blocked)
-            for a in living()
-        )
-        if revealed or blockage_replan:
-            do_replan()
-            replanned = True
+        # Observe from the new node (scout reveals; attacker is blind), then
+        # resolve an encounter if the node is a live target.
+        observe_and_reveal(env_map, ground_truth, [a], events, clock, verbose)
+        if env_map.nodes[v].get("type") == "target_unreached":
+            resolve_combat_on_arrival(env_map, ground_truth, a, i, v,
+                                      events, clock, verbose)
 
-        # --- 3. Move each living agent; resolve combat on contact ---
-        any_progress = False
-        combat_happened = False
-        for idx, agent in enumerate(agents):
-            if not agent.alive:
-                continue
-            for _ in range(agent.movement_modifier):
-                if len(agent.planned_path) < 2:
-                    break
-                next_node = agent.planned_path[1]
-                if not ground_truth.has_edge(agent.position, next_node):
-                    break  # edge blocked in reality; wait for replan
-                cost = ground_truth.edges[agent.position, next_node]["distance"]
-                agent.move(agent.position, next_node, cost)
-                any_progress = True
-                # Stepping onto a live target triggers an encounter.
-                if env_map.nodes[next_node].get("type") == "target_unreached":
-                    resolve_combat_on_arrival(env_map, ground_truth, agent, idx,
-                                              next_node, events, turn, verbose)
-                    combat_happened = True
-                    break  # stop this agent's movement for the turn
+        # Re-plan the living at-a-node team and (re)schedule their next edges.
+        do_replan()
+        for j in range(n):
+            schedule(j)
 
-        # --- 4. Replan after any encounter (win/draw/death all change state) ---
-        if combat_happened:
-            do_replan()
-            replanned = True
+    emit_frame(clock)  # final state
 
-        # --- 5. Stall detection ---
-        if not any_progress and not replanned:
-            break
-
-        turn += 1
-        _maybe_render(turn)
-
-    remaining = [n for n, d in env_map.nodes(data=True)
+    remaining = [nd for nd, d in env_map.nodes(data=True)
                  if d.get("type") == "target_unreached"]
-    eliminated = [n for n, d in env_map.nodes(data=True)
+    eliminated = [nd for nd, d in env_map.nodes(data=True)
                   if d.get("type") == "target_reached"]
+    deaths = [i for i, a in enumerate(agents) if not a.alive]
+    makespan = clock
     return {
         "env_map": env_map,
         "agents": agents,
-        "turns": turn,
+        "makespan": makespan,
+        "objective": makespan + death_penalty * len(deaths),
         "completed": not remaining,
         "remaining_targets": remaining,
         "eliminated_targets": eliminated,
-        "deaths": [i for i, a in enumerate(agents) if not a.alive],
+        "deaths": deaths,
+        "num_deaths": len(deaths),
         "survivors": [i for i, a in enumerate(agents) if a.alive],
         "total_cost": sum(a.total_traversal_cost for a in agents),
         "per_agent_cost": [a.total_traversal_cost for a in agents],

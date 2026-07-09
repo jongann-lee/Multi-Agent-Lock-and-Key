@@ -8,13 +8,14 @@ Multi_Agent.rps_simulation.run_rps_simulation with a pluggable policy
 (defaults to the naive type-aware placeholder -- swap in your baseline).
 
 This mirrors the graph-building half of multi_agent_simulation.py but stays
-self-contained so it doesn't disturb the base benchmark. Rendering is not wired
-yet (simulation_utils isn't RPS-aware -- no type/death glyphs); this prints and
-writes a JSON/CSV summary only.
+self-contained so it doesn't disturb the base benchmark. The simulation runs in
+continuous time (discrete-event): edge cost == traversal time, and the reported
+objective is the makespan plus a death penalty. ``--render`` writes interpolated
+per-turn PNGs + an MP4; otherwise it prints and writes a JSON/CSV summary.
 
     uv run python Multi_Agent/rps_real_map.py --help
-    uv run python Multi_Agent/rps_real_map.py --seed 0
-    uv run python Multi_Agent/rps_real_map.py --agents 0,1,2,3 --seed 1
+    uv run python Multi_Agent/rps_real_map.py --policy baseline1 --seed 0
+    uv run python Multi_Agent/rps_real_map.py --policy baseline1 --seed 1 --render
 """
 
 import sys
@@ -143,7 +144,7 @@ def run(dem_path, road_pkl=None, n_size=64, source=(0, 0), targets=DEFAULT_TARGE
         reward_ratio=1.0, obs_discount_factor=0.9,
         sample_recursion=2, sample_num_obstacle=3, sample_obstacle_hop=4,
         seed=0, output_json=None, output_csv=None, verbose=False,
-        render=False, render_dir=None, output_mp4=None, mp4_fps=4):
+        render=False, render_dir=None, output_mp4=None, mp4_fps=4, render_dt=1.0):
     random.seed(seed)
     np.random.seed(seed)
 
@@ -174,7 +175,7 @@ def run(dem_path, road_pkl=None, n_size=64, source=(0, 0), targets=DEFAULT_TARGE
         reward_ratio=reward_ratio, obs_discount_factor=obs_discount_factor,
         sample_recursion=sample_recursion, sample_num_obstacle=sample_num_obstacle,
         sample_obstacle_hop=sample_obstacle_hop, verbose=verbose,
-        render_dir=render_dir if render else None,
+        render_dir=render_dir if render else None, render_dt=render_dt,
     )
     runtime = time.perf_counter() - t0
 
@@ -189,7 +190,8 @@ def run(dem_path, road_pkl=None, n_size=64, source=(0, 0), targets=DEFAULT_TARGE
             print(f"ffmpeg failed: {e}")
 
     print("-" * 56)
-    print(f"completed:   {result['completed']}  (turns={result['turns']})")
+    print(f"completed:   {result['completed']}")
+    print(f"makespan:    {result['makespan']:.2f}   objective: {result['objective']:.2f}")
     print(f"eliminated:  {len(result['eliminated_targets'])}/{len(list(targets))} targets")
     if result["remaining_targets"]:
         print(f"remaining:   {result['remaining_targets']}")
@@ -205,7 +207,9 @@ def run(dem_path, road_pkl=None, n_size=64, source=(0, 0), targets=DEFAULT_TARGE
             "agent_types": [TYPE_NAMES[t] for t in agent_types],
             "target_types": {str(t): TYPE_NAMES[tt] for t, tt in target_types.items()},
             "completed": result["completed"],
-            "turns": result["turns"],
+            "makespan": result["makespan"],
+            "objective": result["objective"],
+            "num_deaths": result["num_deaths"],
             "eliminated": len(result["eliminated_targets"]),
             "remaining_targets": [str(t) for t in result["remaining_targets"]],
             "deaths": [TYPE_NAMES[agents[i].agent_type] for i in result["deaths"]],
@@ -250,6 +254,8 @@ def main():
     p.add_argument("--output-mp4",
                    default=os.path.join(here, "my_policy_simulation", "rps_simulation.mp4"))
     p.add_argument("--mp4-fps", type=int, default=4)
+    p.add_argument("--render-dt", type=float, default=1.0,
+                   help="sim-time between rendered frames (continuous time)")
     p.add_argument("--output-json",
                    default=os.path.join(here, "my_policy_simulation", "rps_summary.json"))
     p.add_argument("--output-csv",
@@ -275,7 +281,7 @@ def main():
         agent_types=agent_types, policy=policy, seed=args.seed, verbose=args.verbose,
         output_json=args.output_json, output_csv=args.output_csv,
         render=args.render, render_dir=args.render_dir,
-        output_mp4=args.output_mp4, mp4_fps=args.mp4_fps)
+        output_mp4=args.output_mp4, mp4_fps=args.mp4_fps, render_dt=args.render_dt)
 
 
 if __name__ == "__main__":

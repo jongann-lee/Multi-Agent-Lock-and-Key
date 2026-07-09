@@ -192,7 +192,8 @@ def _rps_legend_handles():
     return handles
 
 
-def render_rps_frame(env_map, ground_truth, agents, turn_idx, output_path, title=None):
+def render_rps_frame(env_map, ground_truth, agents, turn_idx, output_path,
+                     title=None, agent_xy=None):
     """Render one frame of the Rock-Scissor-Paper simulation to PNG.
 
     Same layout as render_simulation_frame (terrain by height, obstacles black,
@@ -209,6 +210,10 @@ def render_rps_frame(env_map, ground_truth, agents, turn_idx, output_path, title
         ground_truth: reality (terrain, obstacles, roads, positions).
         agents: list of Agent (with .agent_type, .alive, .trajectory,
             .planned_path, .position).
+        agent_xy: optional list of (x, y) coordinates, one per agent, giving
+            each agent's *interpolated* position (used by the continuous-time
+            driver to draw agents mid-edge). When None, agents are drawn at
+            their current node.
     """
     pos = nx.get_node_attributes(ground_truth, 'pos')
     all_heights = [d.get('height', 0) for _, d in ground_truth.nodes(data=True)]
@@ -234,12 +239,17 @@ def render_rps_frame(env_map, ground_truth, agents, turn_idx, output_path, title
     if road_segments:
         ax.add_collection(mc.LineCollection(road_segments, colors='#404040', linewidths=2.0, zorder=4))
 
+    def _apos(i, agent):
+        return agent_xy[i] if agent_xy is not None else pos[agent.position]
+
     # Trajectory (solid) + planned path (dotted), colored per agent type.
-    for agent in agents:
+    for i, agent in enumerate(agents):
         color = _rps_agent_color(agent)
-        if len(agent.trajectory) >= 2:
-            segs = [[pos[agent.trajectory[k]], pos[agent.trajectory[k + 1]]]
-                    for k in range(len(agent.trajectory) - 1)]
+        traj_pts = [pos[nd] for nd in agent.trajectory]
+        if agent_xy is not None:
+            traj_pts.append(agent_xy[i])   # extend the trail to the interpolated point
+        if len(traj_pts) >= 2:
+            segs = [[traj_pts[k], traj_pts[k + 1]] for k in range(len(traj_pts) - 1)]
             ax.add_collection(mc.LineCollection(segs, colors=color, linewidths=4.0, zorder=5))
         if agent.alive and len(agent.planned_path) >= 2:
             segs = [[pos[agent.planned_path[k]], pos[agent.planned_path[k + 1]]]
@@ -257,8 +267,8 @@ def render_rps_frame(env_map, ground_truth, agents, turn_idx, output_path, title
     # (e.g. it just engaged, or died there) the target's revealed type stays
     # visible -- the agent's presence is still shown by its trajectory line.
     ag_by_color = defaultdict(list)
-    for agent in agents:
-        ag_by_color[_rps_agent_color(agent)].append(pos[agent.position])
+    for i, agent in enumerate(agents):
+        ag_by_color[_rps_agent_color(agent)].append(_apos(i, agent))
     for c, pts in ag_by_color.items():
         ax.scatter([p[0] for p in pts], [p[1] for p in pts], marker='o', s=140,
                    facecolor=c, edgecolor='black', linewidths=1.2, zorder=11)

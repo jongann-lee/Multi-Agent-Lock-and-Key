@@ -232,7 +232,7 @@ def test_end_to_end_clears_all_targets():
         Agent((0, 0), agent_type=SCISSOR),
         Agent((0, 0), agent_type=PAPER),
     ]
-    result = run_rps_simulation(env_map, truth, agents, max_turns=200)
+    result = run_rps_simulation(env_map, truth, agents)
 
     assert result["completed"], (
         f"not completed; remaining={result['remaining_targets']}")
@@ -254,7 +254,7 @@ def test_unbeatable_target_left_incomplete():
     init_target_types(env_map, truth, type_map)
 
     agents = [Agent((0, 0), agent_type=SCOUT), Agent((0, 0), agent_type=ROCK)]
-    result = run_rps_simulation(env_map, truth, agents, max_turns=100)
+    result = run_rps_simulation(env_map, truth, agents)
 
     assert not result["completed"]
     assert result["remaining_targets"] == [(0, 3)]
@@ -349,7 +349,7 @@ def test_baseline1_blind_attacker_dies_charging_unknown():
     init_target_types(env, truth, type_map)
 
     rock = Agent((0, 0), agent_type=ROCK)
-    result = run_rps_simulation(env, truth, [rock], policy=b1.replan, max_turns=50)
+    result = run_rps_simulation(env, truth, [rock], policy=b1.replan)
     assert not rock.alive                     # died on the blind gamble
     assert not result["completed"]
     assert result["remaining_targets"] == [(0, 3)]
@@ -381,10 +381,45 @@ def test_baseline1_end_to_end():
     init_target_types(env, truth, type_map)
 
     agents = [Agent((0, 0), agent_type=t) for t in (SCOUT, ROCK, SCISSOR, PAPER)]
-    result = run_rps_simulation(env, truth, agents, policy=b1.replan, max_turns=200)
+    result = run_rps_simulation(env, truth, agents, policy=b1.replan)
     assert result["completed"], result["remaining_targets"]
     assert agents[0].alive                       # scout survives
     assert all(a.alive for a in agents[1:])      # no attacker dies
+    assert result["makespan"] > 0                # continuous-time completion
+
+
+# ---------------------------------------------------------------------------
+# 6. Continuous time: makespan reflects traversal cost.
+# ---------------------------------------------------------------------------
+
+def _weighted_line(costs):
+    """Line 0..len(costs) with per-edge distances = costs; node 0 = source."""
+    G = nx.DiGraph()
+    for i in range(len(costs) + 1):
+        G.add_node(i, type="intermediate", pos=(i, 0))
+    for i, c in enumerate(costs):
+        for a, b in ((i, i + 1), (i + 1, i)):
+            G.add_edge(a, b, distance=float(c), observed_edge=False, num_used=1.0)
+    G.nodes[0]["type"] = "source"
+    return G
+
+
+def test_makespan_equals_traversal_cost():
+    # Edge costs 2,3,5; a scissor target at node 3; a rock attacker (rock beats
+    # scissor). The rock charges (blind, unknown) and wins at node 3. Makespan
+    # must equal the summed edge costs, i.e. time == cost.
+    costs = [2.0, 3.0, 5.0]
+    truth = _weighted_line(costs)
+    env = _weighted_line(costs)
+    for g in (truth, env):
+        g.nodes[3]["type"] = "target_unreached"
+    init_target_types(env, truth, {3: SCISSOR})
+    rock = Agent(0, agent_type=ROCK)
+    result = run_rps_simulation(env, truth, [rock], policy=b1.replan)
+    assert result["completed"]
+    assert rock.alive
+    assert abs(result["makespan"] - sum(costs)) < 1e-9   # 2+3+5 = 10
+    assert abs(rock.total_traversal_cost - sum(costs)) < 1e-9
 
 
 # ---------------------------------------------------------------------------
