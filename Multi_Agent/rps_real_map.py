@@ -244,7 +244,8 @@ def main():
     p.add_argument("--seed", type=int, default=0)
     p.add_argument("--agents", default="0,1,2,3",
                    help="comma-separated agent type ids (0=scout,1=rock,2=scissor,3=paper)")
-    p.add_argument("--policy", choices=["baseline1", "scout_gtsp", "placeholder"],
+    p.add_argument("--policy",
+                   choices=["baseline1", "scout_gtsp", "scout_wrp", "placeholder"],
                    default="baseline1",
                    help="assignment policy (default: baseline1)")
     p.add_argument("--verbose", action="store_true")
@@ -277,6 +278,8 @@ def main():
         from Multi_Agent.baseline1_all_key import replan as policy
     elif args.policy == "scout_gtsp":
         from Multi_Agent.scout_gtsp import replan as policy
+    elif args.policy == "scout_wrp":
+        from Multi_Agent.scout_wrp import replan as policy
     else:
         policy = naive_type_aware_replan
 
